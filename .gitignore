@@ -1,0 +1,109 @@
+# =============================================================================
+# macOS / Swift Package Manager
+# =============================================================================
+
+# Swift Package Manager build directory
+.build/
+.swiftpm/
+
+# Xcode (if project is opened in Xcode)
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+DerivedData/
+*.moved-aside
+*.ipa
+*.dSYM.zip
+*.dSYM
+xcuserdata/
+
+# =============================================================================
+# Android / Gradle
+# =============================================================================
+
+# Gradle files
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Generated files
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Android Studio
+*.iml
+.idea/
+captures/
+.externalNativeBuild/
+.cxx/
+*.hprof
+
+# =============================================================================
+# IDE / Editors
+# =============================================================================
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# VS Code
+.vscode/
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+.elc
+auto-save-list
+tramp
+
+# =============================================================================
+# OS Generated Files
+# =============================================================================
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+*~
+
+# =============================================================================
+# Miscellaneous
+# =============================================================================
+
+# Logs
+*.log
+
+# Crash reports
+crash.log
+crash_*.log
+
+# Secrets / credentials (never commit these)
+*.keystore
+*.jks
+google-services.json
+secrets.properties

@@ -1,0 +1,16 @@
+#!/bin/sh
+# Use existing gradle from wrapper cache
+GRADLE_BIN="$HOME/.gradle/wrapper/dists/gradle-8.11.1-bin/gradle-8.11.1/bin/gradle"
+
+if [ ! -f "$GRADLE_BIN" ]; then
+    # Try other version
+    GRADLE_BIN=$(find "$HOME/.gradle/wrapper/dists" -name "gradle" -type f -perm +111 2>/dev/null | head -1)
+fi
+
+if [ -z "$GRADLE_BIN" ] || [ ! -f "$GRADLE_BIN" ]; then
+    echo "Error: Could not find gradle binary in ~/.gradle/wrapper/dists"
+    echo "Please run: brew install gradle"
+    exit 1
+fi
+
+exec "$GRADLE_BIN" "$@"

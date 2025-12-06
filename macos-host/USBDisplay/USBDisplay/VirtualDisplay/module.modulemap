@@ -1,0 +1,4 @@
+module VirtualDisplay {
+    umbrella header "VirtualDisplayManager.h"
+    export *
+}
