@@ -13,6 +13,8 @@ let package = Package(
         .executable(name: "vdprobe", targets: ["VirtualDisplayProbe"]),
         // Draws a machine-readable clock, for measuring end-to-end latency.
         .executable(name: "latencyclock", targets: ["LatencyClock"]),
+        // Posts gestures and reports whether applications reacted.
+        .executable(name: "gesturelab", targets: ["GestureLab"]),
         .library(name: "USBDisplayCore", targets: ["USBDisplayCore"])
     ],
     targets: [
@@ -60,6 +62,15 @@ let package = Package(
         .executableTarget(
             name: "LatencyClock",
             path: "Sources/LatencyClock",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("CoreGraphics")
+            ]
+        ),
+        .executableTarget(
+            name: "GestureLab",
+            dependencies: ["USBDisplayCore"],
+            path: "Sources/GestureLab",
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("CoreGraphics")

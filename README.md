@@ -141,15 +141,17 @@ byte layout, so the two cannot drift apart quietly.
 
 ## Known limitations
 
-- **This depends on a private Apple API** with no supported alternative. It can
-  break in any macOS update. [docs/STATUS.md](docs/STATUS.md) has the version
-  history, the sources, and the diagnostic to run.
-- **Pinch-to-zoom is best-effort.** CoreGraphics has no public way to post a
-  gesture event; magnification is synthesised, and some apps will ignore it.
+- **The virtual display uses a private, undocumented CoreGraphics API.**
+  Verified working on macOS 26.6.2; `swift run vdprobe` checks your own machine
+  in ten seconds. There is no public API that does this.
+- **Pinch to zoom uses ⌘+ / ⌘− by default, so it is stepped rather than
+  smooth, and only works in applications that have those shortcuts.** The
+  smooth trackpad-gesture path is implemented but macOS 26.6.2 does not deliver
+  synthesised magnify events at all — measured, with the per-application table
+  in [docs/STATUS.md](docs/STATUS.md). Two-finger scroll is unaffected and is
+  a real trackpad scroll.
 - **Wireless mode does not encrypt the video.** Pairing authenticates the
   device; it does not hide the pixels. See [docs/WIRELESS.md](docs/WIRELESS.md).
-- **Frame delivery follows screen changes** — a still screen sends few frames.
-  That is ScreenCaptureKit behaving correctly, not a stall.
 - **Much of this is untested on real hardware.**
   [docs/STATUS.md](docs/STATUS.md) lists exactly which parts.
 
@@ -162,9 +164,11 @@ macos-host/USBDisplayApp/
   Sources/VirtualDisplay/     Objective-C bridge to the private CoreGraphics API
   Sources/VirtualDisplayProbe/  vdprobe — does the private API work here?
   Sources/LatencyClock/       latencyclock — machine-readable clock for measurement
+  Sources/GestureLab/         gesturelab — posts gestures, to find out what works
   Tests/                      63 tests
 android-client/               Kotlin client, 36 tests
-tools/                        build-app.sh, measure-latency.sh, decode-clock.py
+tools/                        build-app.sh, measure-latency.sh, decode-clock.py,
+                              pen-probe.sh
 docs/                         STATUS.md, WACOM-MOVINK.md, WIRELESS.md, evidence/
 ```
 

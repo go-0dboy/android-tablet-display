@@ -65,7 +65,13 @@ final class StreamingSession: ObservableObject {
     var touchMode: TouchMode = .pointer {
         didSet { injector?.touchMode = touchMode }
     }
+    var zoomStrategy: ZoomStrategy = .keyboardSteps {
+        didSet { injector?.zoomStrategy = zoomStrategy }
+    }
     var transport: TransportMode = .usb
+    /// Desktop scale on the tablet. Changing it rebuilds the display, because
+    /// the mode has to change underneath macOS.
+    var scalePreference: ScalePreference = .automatic
 
     /// Wireless sessions must authenticate before a single frame is sent.
     /// Over USB the cable is the authorisation and this stays nil.
@@ -80,6 +86,9 @@ final class StreamingSession: ObservableObject {
     private var statsTimer: Timer?
     private var statsTick = 0
     private var restartWorkItem: DispatchWorkItem?
+    /// Kept so a scale change can rebuild the display without waiting for the
+    /// client to reconnect and say hello again.
+    private var lastHello: ClientHello?
 
     // MARK: - Lifecycle
 
@@ -220,7 +229,9 @@ final class StreamingSession: ObservableObject {
                 + "pipeline; if the stream stalls, turn DeX off.")
         }
 
-        let spec = DisplayGeometry.spec(for: hello, refreshRate: Double(frameRate))
+        lastHello = hello
+        let spec = DisplayGeometry.spec(for: hello, refreshRate: Double(frameRate),
+                                        scale: scalePreference)
         guard createDisplay(spec: spec) else {
             inputServer?.send(.helloAck(HelloAck(
                 accepted: false, displayWidth: 0, displayHeight: 0,
@@ -257,6 +268,7 @@ final class StreamingSession: ObservableObject {
         } else {
             let created = InputInjector(displayID: displayID)
             created.touchMode = touchMode
+            created.zoomStrategy = zoomStrategy
             injector = created
         }
         return true
@@ -313,6 +325,22 @@ final class StreamingSession: ObservableObject {
             displayID = 0
             onStateChanged?()
         }
+    }
+
+    /// Rebuild the display at a new scale, reusing what the client already
+    /// told us about itself.
+    func applyScaleChange() async {
+        guard isRunning, let hello = lastHello else { return }
+        let spec = DisplayGeometry.spec(for: hello, refreshRate: Double(frameRate),
+                                        scale: scalePreference)
+        log("Rebuilding the display at \(scalePreference.title.lowercased())")
+        await capturer?.stop()
+        capturer = nil
+        guard createDisplay(spec: spec) else { return }
+        stats.displaySize = "\(spec.pixelWidth)x\(spec.pixelHeight)"
+            + (spec.hiDPI ? " HiDPI" : "")
+        await startCapture(spec: spec)
+        onStateChanged?()
     }
 
     // MARK: - Sleep, wake, restart

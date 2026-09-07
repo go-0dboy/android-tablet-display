@@ -213,3 +213,55 @@ final class DisplayGeometryTests: XCTestCase {
             DisplayGeometry.displayName(for: String(repeating: "x", count: 200)).count, 40)
     }
 }
+
+final class ScalePreferenceTests: XCTestCase {
+
+    /// A 14-inch tablet at 2560x1600 is the case the automatic rule is least
+    /// sure about, so the person must be able to overrule it in both
+    /// directions.
+    private let tablet = ClientHello(widthPixels: 2560, heightPixels: 1600,
+                                     densityDpi: 240, rotationDegrees: 0,
+                                     flags: [], deviceName: "14-inch tablet")
+
+    func testMoreSpaceGivesTheFullNativeDesktop() {
+        let spec = DisplayGeometry.spec(for: tablet, scale: .moreSpace)
+        XCTAssertFalse(spec.hiDPI)
+        XCTAssertEqual(spec.pointWidth, 2560)
+        XCTAssertEqual(spec.pointHeight, 1600)
+    }
+
+    func testLargerTextGivesAHiDPIDesktop() {
+        let spec = DisplayGeometry.spec(for: tablet, scale: .largerText)
+        XCTAssertTrue(spec.hiDPI)
+        XCTAssertEqual(spec.pointWidth, 1280)
+        XCTAssertEqual(spec.pixelWidth, 2560)
+    }
+
+    func testAutomaticStillFollowsDensity() {
+        XCTAssertTrue(DisplayGeometry.spec(for: tablet, scale: .automatic).hiDPI)
+
+        let lowDensity = ClientHello(widthPixels: 1920, heightPixels: 1080,
+                                     densityDpi: 140, rotationDegrees: 0,
+                                     flags: [], deviceName: "low dpi")
+        XCTAssertFalse(DisplayGeometry.spec(for: lowDensity, scale: .automatic).hiDPI)
+    }
+
+    /// Whatever the preference, the backing store must not change — only how
+    /// macOS lays the desktop out on it.
+    func testScaleNeverChangesTheBackingStore() {
+        for preference in ScalePreference.allCases {
+            let spec = DisplayGeometry.spec(for: tablet, scale: preference)
+            XCTAssertEqual(spec.pixelWidth, 2560, "\(preference) changed the backing store")
+            XCTAssertEqual(spec.pixelHeight, 1600)
+        }
+    }
+
+    /// Forcing HiDPI on a small panel must not produce an unusably tiny desktop.
+    func testLargerTextOnASmallPanelStaysUsable() {
+        let phone = ClientHello(widthPixels: 720, heightPixels: 480, densityDpi: 160,
+                                rotationDegrees: 0, flags: [], deviceName: "small")
+        let spec = DisplayGeometry.spec(for: phone, scale: .largerText)
+        XCTAssertGreaterThanOrEqual(spec.pointWidth, 320)
+        XCTAssertGreaterThanOrEqual(spec.pointHeight, 240)
+    }
+}

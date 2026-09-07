@@ -36,6 +36,30 @@ public struct VirtualDisplaySpec: Equatable, Sendable {
     public var physicalHeightMM: Double { Double(pixelHeight) / Double(ppi) * 25.4 }
 }
 
+/// How much desktop the person wants on the tablet.
+///
+/// The automatic choice is right for a phone and for most tablets, but it is a
+/// guess: a 14-inch tablet at 2560x1600 gets a 1280x800 desktop, which is
+/// crisp but coarse, while someone using it as a second monitor may want the
+/// full 2560x1600 and smaller text. That is taste, not a fact the host can
+/// derive, so it is a setting.
+public enum ScalePreference: String, CaseIterable, Sendable {
+    /// Pick from the panel's density. HiDPI above ~200 dpi.
+    case automatic
+    /// Native resolution, smallest text, most desktop.
+    case moreSpace
+    /// HiDPI, largest text, least desktop.
+    case largerText
+
+    public var title: String {
+        switch self {
+        case .automatic:   return "Automatic"
+        case .moreSpace:   return "More space (smaller text)"
+        case .largerText:  return "Larger text (sharper)"
+        }
+    }
+}
+
 public enum DisplayGeometry {
 
     /// H.264 levels and most hardware decoders want even dimensions; some
@@ -57,7 +81,8 @@ public enum DisplayGeometry {
     ///     cannot ask the encoder for something it cannot sustain.
     public static func spec(for hello: ClientHello,
                             refreshRate: Double = 60,
-                            maxPixels: Int = 4096) -> VirtualDisplaySpec {
+                            maxPixels: Int = 4096,
+                            scale: ScalePreference = .automatic) -> VirtualDisplaySpec {
 
         // Rotation is applied by the client's own window manager, so the
         // surface it hands us is already in its final orientation — but a
@@ -77,7 +102,12 @@ public enum DisplayGeometry {
         height = alignedDown(height)
 
         let dpi = Int(hello.densityDpi)
-        let useHiDPI = dpi >= hiDPIThresholdDPI
+        let useHiDPI: Bool
+        switch scale {
+        case .automatic:  useHiDPI = dpi >= hiDPIThresholdDPI
+        case .moreSpace:  useHiDPI = false
+        case .largerText: useHiDPI = true
+        }
 
         // In HiDPI the mode is half the backing store, which is what makes
         // macOS report "looks like WxH" at half the pixel count.

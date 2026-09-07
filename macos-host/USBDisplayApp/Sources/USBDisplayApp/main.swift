@@ -78,6 +78,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         session.onStateChanged = { [weak self] in self?.rebuildMenu() }
         session.touchMode = TouchMode(
             rawValue: UserDefaults.standard.string(forKey: "touchMode") ?? "") ?? .pointer
+        session.scalePreference = ScalePreference(
+            rawValue: UserDefaults.standard.string(forKey: "scalePreference") ?? "") ?? .automatic
+        session.zoomStrategy = ZoomStrategy(
+            rawValue: UserDefaults.standard.string(forKey: "zoomStrategy") ?? "") ?? .keyboardSteps
         session.pairing = pairing
 
         pairing.onPairingNeedsConfirmation = { [weak self] pending in
@@ -360,6 +364,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         touchItem.submenu = touchMenu
         menu.addItem(touchItem)
 
+        let scaleItem = NSMenuItem(title: "Desktop size", action: nil, keyEquivalent: "")
+        let scaleMenu = NSMenu()
+        for preference in ScalePreference.allCases {
+            let item = NSMenuItem(title: preference.title, action: #selector(setScale(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.state = session.scalePreference == preference ? .on : .off
+            item.representedObject = preference.rawValue
+            scaleMenu.addItem(item)
+        }
+        scaleItem.submenu = scaleMenu
+        menu.addItem(scaleItem)
+
+        let zoomItem = NSMenuItem(title: "Pinch to zoom", action: nil, keyEquivalent: "")
+        let zoomMenu = NSMenu()
+        for strategy in ZoomStrategy.allCases {
+            let item = NSMenuItem(title: strategy.title, action: #selector(setZoomStrategy(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.state = session.zoomStrategy == strategy ? .on : .off
+            item.representedObject = strategy.rawValue
+            zoomMenu.addItem(item)
+        }
+        zoomItem.submenu = zoomMenu
+        menu.addItem(zoomItem)
+
         let autoItem = action("Connect automatically when plugged in", #selector(toggleAutoConnect))
         autoItem.state = autoConnect ? .on : .off
         menu.addItem(autoItem)
@@ -440,6 +470,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         session.touchMode = mode
         UserDefaults.standard.set(raw, forKey: "touchMode")
         adb.sendClientAction("SET_TOUCH_MODE", extras: ["mode": raw])
+        rebuildMenu()
+    }
+
+    @objc private func setScale(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let preference = ScalePreference(rawValue: raw) else { return }
+        session.scalePreference = preference
+        UserDefaults.standard.set(raw, forKey: "scalePreference")
+        Task { await session.applyScaleChange() }
+        rebuildMenu()
+    }
+
+    @objc private func setZoomStrategy(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let strategy = ZoomStrategy(rawValue: raw) else { return }
+        session.zoomStrategy = strategy
+        UserDefaults.standard.set(raw, forKey: "zoomStrategy")
         rebuildMenu()
     }
 

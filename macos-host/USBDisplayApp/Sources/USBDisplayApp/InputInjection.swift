@@ -24,12 +24,20 @@ private let NX_SUBTYPE_DEFAULT: Int64 = 0
 private let NX_SUBTYPE_TABLET_POINT: Int64 = 1
 private let NX_SUBTYPE_TABLET_PROXIMITY: Int64 = 2
 
-/// CGEventType 29 is NSEventTypeMagnify. There is no public CoreGraphics
-/// constructor for a gesture event, so a pinch is built by hand. This is the
-/// same approach trackpad-emulation tools use; treat it as best-effort.
-private let kCGEventTypeMagnify = CGEventType(rawValue: 29)!
-/// Event field 33 carries the magnification delta on a magnify event.
-private let kCGMagnificationField = CGEventField(rawValue: 33)!
+/// NSEvent gesture types. CGEventType does not expose them, and the value
+/// matters: 29 is NSEventTypeGesture, which AppKit delivers as a generic
+/// gesture carrying no magnification. Magnify is 30.
+private let kNSEventTypeMagnify = CGEventType(rawValue: 30)!
+private let kNSEventTypeBeginGesture = CGEventType(rawValue: 19)!
+private let kNSEventTypeEndGesture = CGEventType(rawValue: 20)!
+
+/// Undocumented event fields carrying a gesture's amount and phase.
+private let kCGGestureValueField = CGEventField(rawValue: 113)!
+private let kCGGesturePhaseField = CGEventField(rawValue: 132)!
+
+/// Virtual key codes.
+private let kVK_ANSI_Equal: CGKeyCode = 24
+private let kVK_ANSI_Minus: CGKeyCode = 27
 
 /// Identity we present as the tablet. Constant, so an app that remembers a
 /// tablet between sessions sees the same one.
@@ -65,6 +73,11 @@ final class InputInjector {
 
     /// Set from the menu. Read on the input thread, written on main.
     var touchMode: TouchMode = .pointer
+    /// How a pinch is delivered. Defaults to the strategy that was measured to
+    /// work on this macOS; see handle(pinch:).
+    var zoomStrategy: ZoomStrategy = .keyboardSteps
+
+    private var zoomAccumulator = ZoomStepAccumulator()
 
     init(displayID: CGDirectDisplayID) {
         self.displayID = displayID
@@ -278,27 +291,134 @@ final class InputInjector {
                                wheel1: Int32(event.deltaY.rounded()),
                                wheel2: Int32(event.deltaX.rounded()),
                                wheel3: 0) else { return }
-        // Marking it continuous makes macOS treat it as a trackpad scroll —
-        // which is what gives momentum-aware apps the right feel.
+        // Marking it continuous makes macOS treat it as a trackpad scroll
+        // rather than a mouse wheel, and the phase fields are what
+        // momentum-aware applications look for. Verified delivered with the
+        // right deltas and phases against a receiver that logs NSEvents.
         cg.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        cg.setIntegerValueField(.scrollWheelEventScrollPhase,
+                                value: GesturePhase.from(event.phase).rawValue)
+        cg.setIntegerValueField(.scrollWheelEventMomentumPhase,
+                                value: ScrollMomentumPhase.none.rawValue)
         cg.post(tap: .cghidEventTap)
     }
 
-    /// Pinch to zoom. CoreGraphics has no public gesture constructor, so this
-    /// builds an NSEventTypeMagnify event by hand. Best-effort: apps that only
-    /// honour Cmd+scroll will not respond to it.
+    /// Pinch to zoom.
+    ///
+    /// There is no public way to post a gesture on macOS, so this was settled
+    /// by measurement rather than by reading. Findings on macOS 26.6.2, using
+    /// the `gesturelab` tool in this repo against a receiver that logs what
+    /// AppKit actually delivers:
+    ///
+    ///   * Synthesising NSEventTypeMagnify (type 30) with the magnification
+    ///     and phase fields produces an event that is never delivered at all —
+    ///     not to the target application, and not even to a local event
+    ///     monitor. Thirteen values of the gesture-type field were tried
+    ///     across all three phases. The kept code is correct as far as anyone
+    ///     can tell; the system simply drops it.
+    ///   * Command held with a scroll wheel does reach the application, but
+    ///     the modifier does not stick to the scroll events, so nothing zooms.
+    ///   * Command-plus and command-minus work.
+    ///
+    /// So the default is keyboard steps, because it is the one that was
+    /// observed to work. The others are selectable, because this is exactly
+    /// the kind of thing a future macOS may change in either direction, and a
+    /// setting costs nothing.
+    ///
+    /// See docs/STATUS.md for the per-application table.
     func handle(pinch event: PinchEvent) {
         moveCursorIfNeeded()
 
-        guard let cg = CGEvent(source: source) else { return }
-        cg.type = kCGEventTypeMagnify
-        cg.location = lastPoint
-        cg.setDoubleValueField(kCGMagnificationField, value: Double(event.magnification))
-        cg.setIntegerValueField(.mouseEventSubtype, value: NX_SUBTYPE_DEFAULT)
-        cg.post(tap: .cghidEventTap)
+        switch zoomStrategy {
+        case .gestureEvent:  postMagnifyGesture(event)
+        case .commandScroll: postCommandScroll(event)
+        case .keyboardSteps: postZoomKeystrokes(event)
+        }
     }
 
-    /// Park the pointer inside the virtual display so gestures address it.
+    /// The trackpad-native path. Kept because it is the only one that could
+    /// ever be smooth, and because "does not work today" is not "cannot work".
+    private func postMagnifyGesture(_ event: PinchEvent) {
+        let phase = GesturePhase.from(event.phase)
+
+        if phase == .began {
+            post(gesture: kNSEventTypeBeginGesture, phase: .began, value: 0)
+        }
+        post(gesture: kNSEventTypeMagnify, phase: phase, value: Double(event.magnification))
+        if phase == .ended || phase == .cancelled {
+            post(gesture: kNSEventTypeEndGesture, phase: phase, value: 0)
+        }
+    }
+
+    private func post(gesture type: CGEventType, phase: GesturePhase, value: Double) {
+        guard let event = CGEvent(source: source) else { return }
+        event.type = type
+        event.setIntegerValueField(kCGGesturePhaseField, value: phase.rawValue)
+        if value != 0 {
+            event.setDoubleValueField(kCGGestureValueField, value: value)
+        }
+        event.post(tap: .cghidEventTap)
+    }
+
+    private func postCommandScroll(_ event: PinchEvent) {
+        // Scroll deltas are in points; a pinch increment is a ratio, so scale
+        // it into something a zoom-on-scroll application reads as one notch.
+        let delta = Int32((Double(event.magnification) * 400).rounded())
+        guard delta != 0 || event.phase == .down || event.phase == .up else { return }
+
+        guard let scroll = CGEvent(scrollWheelEvent2Source: source, units: .pixel,
+                                   wheelCount: 2, wheel1: delta, wheel2: 0, wheel3: 0)
+        else { return }
+        scroll.flags = .maskCommand
+        scroll.setIntegerValueField(.scrollWheelEventIsContinuous, value: 1)
+        scroll.setIntegerValueField(.scrollWheelEventScrollPhase,
+                                    value: GesturePhase.from(event.phase).rawValue)
+        scroll.post(tap: .cghidEventTap)
+    }
+
+    /// Command-plus and command-minus. Stepped rather than smooth, so a pinch
+    /// is accumulated and a keystroke emitted only when enough has built up —
+    /// otherwise every one of the dozens of increments in a single pinch would
+    /// fire a keypress and the zoom would run away.
+    private func postZoomKeystrokes(_ event: PinchEvent) {
+        switch event.phase {
+        case .down:
+            zoomAccumulator.reset()
+            return
+        case .up, .cancel:
+            zoomAccumulator.reset()
+            return
+        default:
+            break
+        }
+
+        let steps = zoomAccumulator.steps(for: Double(event.magnification))
+        guard steps != 0 else { return }
+
+        let key = steps > 0 ? kVK_ANSI_Equal : kVK_ANSI_Minus
+        for _ in 0..<min(abs(steps), 4) {
+            postKey(key, flags: .maskCommand)
+        }
+    }
+
+    private func postKey(_ keyCode: CGKeyCode, flags: CGEventFlags) {
+        guard let down = CGEvent(keyboardEventSource: source, virtualKey: keyCode,
+                                 keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: keyCode,
+                               keyDown: false) else { return }
+        down.flags = flags
+        up.flags = flags
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+    }
+
+    /// Park the pointer inside the virtual display before a gesture.
+    ///
+    /// This is not a nicety. Scroll and gesture events are routed to the window
+    /// under the POINTER, not to the focused window — posting one with the
+    /// cursor elsewhere sends it to whatever happens to be under the mouse,
+    /// which looks exactly like "gestures do not work". Finding this was the
+    /// difference between scroll appearing broken and scroll being correct.
     private func moveCursorIfNeeded() {
         let bounds = CGDisplayBounds(displayID)
         guard bounds.width > 0 else { return }

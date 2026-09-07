@@ -95,6 +95,67 @@ has never been run against the hardware it is for.
   the display, and the virtual display's termination handler triggers a rebuild.
   Not tested across an actual sleep cycle.
 
+## Gestures: what was measured
+
+There is no public way to post a gesture on macOS, so this was settled by
+experiment rather than by reading. `swift run gesturelab` posts a gesture and a
+small receiver logs what AppKit actually delivers.
+
+**Two-finger scroll works properly.** Verified delivered with the right pixel
+deltas and phase transitions (`began` → `changed` × n → `ended`), marked
+continuous so applications treat it as a trackpad rather than a mouse wheel.
+
+**Pinch is harder, and one finding dominates:** synthesised
+`NSEventTypeMagnify` events are **never delivered on macOS 26.6.2** — not to
+the target application, and not even to a local event monitor in the receiving
+process. Thirteen values of the gesture-type field were tried across all three
+phases. The event is constructed correctly as far as can be determined; the
+system drops it.
+
+| Strategy | Preview | Safari | Maps | Delivered at all? |
+|---|---|---|---|---|
+| Trackpad gesture (type 30 + magnification/phase fields) | no | no | no | **no** — dropped by the system |
+| ⌘ held + scroll wheel | no | no | no | scroll arrives, but the modifier does not stick to it |
+| **⌘+ / ⌘−** | **yes** (34% of pixels changed) | marginal (2.6%) | no | **yes** — arrives as keycode 24 with the command flag |
+
+Measured on macOS 26.6.2 by capturing each application's window before and
+after and comparing pixels; "yes" means more than 6% of pixels changed.
+
+So **⌘+ / ⌘− is the default**, because it is the one observed to work. It is
+stepped rather than smooth, and a pinch produces dozens of small increments, so
+they are accumulated and a keystroke is emitted only when enough has built up —
+otherwise a single pinch would fire a runaway series of keypresses. All three
+strategies are selectable from the menu, because this is exactly the sort of
+behaviour a future macOS may change in either direction.
+
+Two smaller findings worth recording, both of which cost time:
+
+- **`NSEventTypeMagnify` is 30, not 29.** 29 is `NSEventTypeGesture`, which
+  AppKit delivers as a generic gesture carrying no magnification. An earlier
+  version of this code used 29 and the symptom was simply "pinch does nothing".
+- **Scroll and gesture events go to the window under the POINTER**, not the
+  focused window. Posting one without first placing the cursor over the target
+  sends it wherever the mouse happens to be — indistinguishable from the event
+  not working. This is why the injector warps the cursor onto the virtual
+  display before every gesture.
+
+### The path not taken: a virtual trackpad
+
+The Apple-sanctioned way to get real gestures is to present a virtual
+multi-touch trackpad, so the system synthesises the gestures itself from raw
+touches rather than being handed finished ones. That means a user-space HID
+device (`IOHIDUserDevice`) publishing Apple's multitouch digitiser report
+format.
+
+It was not built, and the reason is specific rather than defeatist: it requires
+reproducing Apple's private multitouch report descriptor, which is neither
+documented nor stable, and the device needs either root or an entitlement
+Apple grants case by case. That is a project in its own right, and it would buy
+smooth pinch in exchange for a much larger and more fragile surface than the
+rest of this app put together. If ⌘+ / ⌘− proves too coarse in practice, this
+is the next thing to try, and the `gesturelab` harness already here is what
+would tell you whether it worked.
+
 ## Why there is no glass-to-glass latency number
 
 The obvious method — show a clock, capture the tablet, subtract — does not work
