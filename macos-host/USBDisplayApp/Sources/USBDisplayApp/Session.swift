@@ -35,6 +35,11 @@ struct SessionStats {
     /// Round trip measured from a keep-alive, in milliseconds. Zero until the
     /// client answers one.
     var roundTripMilliseconds: Double = 0
+    /// Capture-to-encoded time on the host, in milliseconds. This is the
+    /// portion of the pipeline the host can measure directly; it excludes the
+    /// wire and everything on the tablet.
+    var encodeMedianMs: Double = 0
+    var encodeWorstMs: Double = 0
 }
 
 @MainActor
@@ -76,6 +81,7 @@ final class StreamingSession: ObservableObject {
     private var frameCount = 0
     private var byteCount = 0
     private var statsTimer: Timer?
+    private var statsTick = 0
     private var restartWorkItem: DispatchWorkItem?
 
     // MARK: - Lifecycle
@@ -362,6 +368,20 @@ final class StreamingSession: ObservableObject {
                 guard let self else { return }
                 self.stats.fps = Double(self.frameCount)
                 self.stats.megabitsPerSecond = Double(self.byteCount) * 8 / 1_000_000
+                if let latency = self.capturer?.drainEncodeLatency() {
+                    self.stats.encodeMedianMs = latency.median
+                    self.stats.encodeWorstMs = latency.worst
+                }
+                // Log a line every 5s so a session leaves a record of how it
+                // actually performed, rather than only showing it in a menu
+                // nobody had open at the time.
+                self.statsTick += 1
+                if self.statsTick % 5 == 0 && self.clientConnected {
+                    log(String(format:
+                        "%.0f fps · %.1f Mbps · encode %.1f ms median, %.1f ms worst",
+                        self.stats.fps, self.stats.megabitsPerSecond,
+                        self.stats.encodeMedianMs, self.stats.encodeWorstMs))
+                }
                 self.frameCount = 0
                 self.byteCount = 0
                 if self.clientConnected { self.onStateChanged?() }

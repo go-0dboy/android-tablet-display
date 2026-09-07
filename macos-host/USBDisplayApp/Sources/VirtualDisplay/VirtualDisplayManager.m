@@ -126,10 +126,32 @@
         });
     };
 
-    CGVirtualDisplay *display = [[CGVirtualDisplay alloc] initWithDescriptor:descriptor];
+    // WindowServer keys a display's saved arrangement to its
+    // vendor/product/serial, so the identity has to stay stable across
+    // restarts -- but it also refuses to create a second display with an
+    // identity that is already in use. Both are true at once, so: try the
+    // stable identity first, and only walk the serial forward if it is taken.
+    CGVirtualDisplay *display = nil;
+    unsigned int serial = spec.serialNum;
+    for (int attempt = 0; attempt < 8; attempt++) {
+        descriptor.serialNum = serial;
+        display = [[CGVirtualDisplay alloc] initWithDescriptor:descriptor];
+        if (display) {
+            if (attempt > 0) {
+                NSLog(@"VirtualDisplayManager: identity %u was taken; using serial %u",
+                      spec.serialNum, serial);
+            }
+            break;
+        }
+        serial++;
+    }
+
     if (!display) {
-        self.lastError = @"CGVirtualDisplay initWithDescriptor: returned nil. The "
-                         @"private API is present but refused these parameters.";
+        self.lastError = @"CGVirtualDisplay initWithDescriptor: returned nil for every "
+                         @"identity tried. The private API is present but refused to "
+                         @"create a display. Another app may be holding several "
+                         @"virtual displays, or macOS has saved a broken configuration "
+                         @"for this identity -- see docs/STATUS.md.";
         NSLog(@"VirtualDisplayManager: %@", self.lastError);
         return NO;
     }

@@ -11,6 +11,8 @@ let package = Package(
         // Standalone diagnostic: does the private virtual-display API work on
         // this machine? Run it before filing a bug.
         .executable(name: "vdprobe", targets: ["VirtualDisplayProbe"]),
+        // Draws a machine-readable clock, for measuring end-to-end latency.
+        .executable(name: "latencyclock", targets: ["LatencyClock"]),
         .library(name: "USBDisplayCore", targets: ["USBDisplayCore"])
     ],
     targets: [
@@ -53,6 +55,14 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("AppKit")
+            ]
+        ),
+        .executableTarget(
+            name: "LatencyClock",
+            path: "Sources/LatencyClock",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("CoreGraphics")
             ]
         ),
         .testTarget(

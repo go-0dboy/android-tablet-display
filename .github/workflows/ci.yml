@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Two independent jobs, because the two halves of this project fail
+# independently and a red badge should say which one.
+jobs:
+  macos-host:
+    name: macOS host
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the toolchain
+        run: |
+          sw_vers
+          swift --version
+
+      - name: Build
+        working-directory: macos-host/USBDisplayApp
+        # SwiftPM's build database does not tolerate some sandboxed
+        # filesystems; keeping the scratch path in the runner's temp
+        # directory avoids the whole class of problem.
+        run: swift build --scratch-path "$RUNNER_TEMP/build"
+
+      - name: Test
+        working-directory: macos-host/USBDisplayApp
+        run: swift test --scratch-path "$RUNNER_TEMP/build"
+
+      - name: Build the .app bundle
+        run: ./tools/build-app.sh release
+        env:
+          USBDISPLAY_BUILD_DIR: ${{ runner.temp }}/app-build
+
+      # Note deliberately NOT run here: vdprobe.
+      #
+      # CI can only prove this project COMPILES. It cannot prove the private
+      # CGVirtualDisplay API works, because a GitHub runner is a VM with no
+      # WindowServer session to create a display in — and the runner image is
+      # not the macOS version anyone runs this on anyway. A green badge here
+      # means "it builds", nothing more. Whether the private API still works
+      # on a given macOS release can only be answered by running
+      # `swift run vdprobe` on that machine. See docs/STATUS.md.
+      - name: Say what this job did and did not prove
+        run: |
+          echo "Built and unit-tested the host."
+          echo "The private virtual-display API was NOT exercised: a CI runner"
+          echo "has no display session. Run 'swift run vdprobe' locally."
+
+  android-client:
+    name: Android client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('android-client/**/*.gradle.kts', 'android-client/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: Unit tests
+        working-directory: android-client
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      - name: Build the APK
+        working-directory: android-client
+        run: ./gradlew assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-debug.apk
+          path: android-client/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error

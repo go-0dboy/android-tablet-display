@@ -1,0 +1,14 @@
+        LG ULTRAGEAR+:
+          Resolution: 5120 x 2160 (Ultra-wide 5K)
+          UI Looks like: 2560 x 1080 @ 165.00Hz
+          Mirror: Off
+          Online: Yes
+        Color LCD:
+          Resolution: 3024 x 1964 Retina
+          Mirror: Off
+          Online: Yes
+        Google sdk gphone64 arm64:
+          Resolution: 2208 x 1072
+          UI Looks like: 2208 x 1072 @ 60.00Hz
+          Mirror: Off
+          Online: Yes

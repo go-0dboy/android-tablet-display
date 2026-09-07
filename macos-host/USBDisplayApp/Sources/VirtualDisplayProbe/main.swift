@@ -68,6 +68,10 @@ let parameters = VirtualDisplayParameters.make(pixelWidth: Int32(spec.pixelWidth
                                        hiDPI: spec.hiDPI,
                                        refreshRate: spec.refreshRate,
                                        name: "vdprobe test display")
+// Use an identity of its own, so the probe still works while the menu bar app
+// is running and holding a display of its own.
+parameters.productID = 0x5679
+parameters.serialNum = 0x9001
 
 guard manager.createDisplay(spec: parameters) else {
     print("create        : REFUSED")

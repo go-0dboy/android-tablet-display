@@ -1,0 +1,43 @@
+=== vdprobe: CGVirtualDisplay availability check ===
+macOS         : 26.6.2
+build         : Version 26.6.2 (Build 25G83)
+architecture  : arm64 (Apple Silicon)
+private API   : all four classes present
+displays before: 3 -> 2(2560x1080) 1(1512x982) 13(2208x1072)
+requesting    : 2560x1600 px / 1280x800 pt @ 240 ppi, hiDPI=true
+create        : OK, displayID=15
+displays after : 4 -> 2(2560x1080) 1(1512x982) 13(2208x1072) 15(1280x800)
+bounds        : 2560,0 1280x800 pt
+backing store : 1280x800 px
+active mode   : 2560x1600 px / 1280x800 pt @ 60Hz
+offered modes : 26
+   800x500 pt / 800x500 px @ 60Hz
+   800x600 pt / 1600x1200 px @ 60Hz (HiDPI)
+   800x600 pt / 800x600 px @ 60Hz
+   960x600 pt / 1920x1200 px @ 60Hz (HiDPI)
+   1024x640 pt / 1024x640 px @ 60Hz
+   1024x768 pt / 1024x768 px @ 60Hz
+   1280x800 pt / 2560x1600 px @ 60Hz (HiDPI)
+   1280x800 pt / 1280x800 px @ 60Hz
+   1280x960 pt / 1280x960 px @ 60Hz
+   1344x840 pt / 1344x840 px @ 60Hz
+   1344x1008 pt / 1344x1008 px @ 60Hz
+   1600x1000 pt / 1600x1000 px @ 60Hz
+   1600x1200 pt / 1600x1200 px @ 60Hz
+   1920x1200 pt / 1920x1200 px @ 60Hz
+   2560x1600 pt / 2560x1600 px @ 60Hz
+   400x300 pt / 800x600 px @ 60Hz (HiDPI)
+   512x320 pt / 1024x640 px @ 60Hz (HiDPI)
+   512x384 pt / 1024x768 px @ 60Hz (HiDPI)
+   640x400 pt / 1280x800 px @ 60Hz (HiDPI)
+   640x400 pt / 1280x800 px @ 60Hz (HiDPI)
+   640x480 pt / 1280x960 px @ 60Hz (HiDPI)
+   640x480 pt / 640x480 px @ 60Hz
+   672x420 pt / 1344x840 px @ 60Hz (HiDPI)
+   672x504 pt / 1344x1008 px @ 60Hz (HiDPI)
+   800x500 pt / 1600x1000 px @ 60Hz (HiDPI)
+   1280x800 pt / 1280x800 px @ 60Hz
+
+RESULT: PASS. Virtual display 15 created and active on this Mac.
+Tearing it down...
+displays after teardown: 3 -> 2(2560x1080) 1(1512x982) 13(2208x1072)

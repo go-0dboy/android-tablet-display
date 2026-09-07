@@ -78,6 +78,9 @@ final class VideoEncoder {
     private var forceKeyframeNext = false
 
     var onEncodedFrame: ((Data, Bool) -> Void)?
+    /// Reports the presentation timestamp of each frame as it comes out, so
+    /// the capturer can pair it with when that frame went in.
+    var onFramePresentationTime: ((Int64) -> Void)?
 
     init(settings: EncoderSettings) throws {
         self.settings = settings
@@ -184,6 +187,7 @@ final class VideoEncoder {
         }
 
         guard !out.isEmpty else { return }
+        onFramePresentationTime?(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value)
         onEncodedFrame?(out, isKeyframe)
     }
 
@@ -276,6 +280,26 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
     private(set) var lastFrameAt: Date?
     private(set) var capturedFrames = 0
 
+    /// Milliseconds from ScreenCaptureKit handing us a frame to the encoder
+    /// producing the compressed bytes. This is the part of the pipeline the
+    /// host can measure honestly; display scanout on the tablet is not
+    /// visible to any software on either machine.
+    private(set) var encodeLatenciesMs: [Double] = []
+    private var pendingCaptureAt: [Int64: CFAbsoluteTime] = [:]
+    private let latencyLock = NSLock()
+
+    /// Summary for the menu and the log: median and worst encode time.
+    func drainEncodeLatency() -> (median: Double, worst: Double, count: Int)? {
+        latencyLock.lock()
+        let samples = encodeLatenciesMs
+        encodeLatenciesMs.removeAll(keepingCapacity: true)
+        latencyLock.unlock()
+
+        guard !samples.isEmpty else { return nil }
+        let sorted = samples.sorted()
+        return (sorted[sorted.count / 2], sorted.last ?? 0, sorted.count)
+    }
+
     func forceKeyframe() { encoder?.forceKeyframe() }
 
     func start(displayID: CGDirectDisplayID, settings: EncoderSettings) async throws {
@@ -312,6 +336,18 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
         encoder.onEncodedFrame = { [weak self] data, isKeyframe in
             self?.onEncodedFrame?(data, isKeyframe)
         }
+        encoder.onFramePresentationTime = { [weak self] presentationValue in
+            guard let self else { return }
+            self.latencyLock.lock()
+            if let captured = self.pendingCaptureAt.removeValue(forKey: presentationValue) {
+                let ms = (CFAbsoluteTimeGetCurrent() - captured) * 1000
+                self.encodeLatenciesMs.append(ms)
+                if self.encodeLatenciesMs.count > 600 {
+                    self.encodeLatenciesMs.removeFirst(300)
+                }
+            }
+            self.latencyLock.unlock()
+        }
         self.encoder = encoder
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
@@ -346,8 +382,17 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
 
         lastFrameAt = Date()
         capturedFrames += 1
-        encoder?.encode(pixelBuffer: pixelBuffer,
-                        timestamp: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+
+        let presentation = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        latencyLock.lock()
+        pendingCaptureAt[presentation.value] = CFAbsoluteTimeGetCurrent()
+        // Never let the map grow without bound if frames are dropped.
+        if pendingCaptureAt.count > 240 {
+            pendingCaptureAt.removeAll(keepingCapacity: true)
+        }
+        latencyLock.unlock()
+
+        encoder?.encode(pixelBuffer: pixelBuffer, timestamp: presentation)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

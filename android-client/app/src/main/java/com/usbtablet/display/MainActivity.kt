@@ -62,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private var inputPort = WireProtocol.DEFAULT_INPUT_PORT
 
     private var frameCount = 0
+    private var byteCount = 0L
     private var lastStatsAt = System.currentTimeMillis()
     private var decoderWidth = 0
     private var decoderHeight = 0
@@ -341,14 +342,16 @@ class MainActivity : AppCompatActivity() {
         Log.d(TAG, "Sent hello: ${metrics.widthPixels}x${metrics.heightPixels} " +
                    "@${metrics.densityDpi}dpi")
 
-        // Read the ack on a side coroutine so video can start immediately.
-        val ackJob = lifecycleScope.launch(Dispatchers.IO) {
-            readAck(inStream, parser)
-        }
+        // Wait briefly for the ack: it carries the size the host actually
+        // created, which after alignment is not always the size we asked for.
+        // Configuring the decoder with the wrong dimensions costs a
+        // reconfigure on the first keyframe.
+        val ack = readAck(inStream, parser)
+        val decodeWidth = ack?.takeIf { it.accepted }?.displayWidth ?: metrics.widthPixels
+        val decodeHeight = ack?.takeIf { it.accepted }?.displayHeight ?: metrics.heightPixels
 
         updateStatus("Starting…")
-        streamVideo(video, metrics)
-        ackJob.cancel()
+        streamVideo(video, decodeWidth, decodeHeight)
     }
 
     /** Pair (or prove we are already paired) before any pixels are sent. */
@@ -403,20 +406,24 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    private fun readAck(inStream: java.io.InputStream, parser: InputStreamParser) {
-        val message = readMessage(inStream, parser, 15_000)
+    private fun readAck(
+        inStream: java.io.InputStream, parser: InputStreamParser
+    ): IncomingMessage.HelloAck? {
+        val message = readMessage(inStream, parser, 8_000)
         if (message is IncomingMessage.HelloAck) {
             if (!message.accepted) {
                 Log.w(TAG, "Host refused the display: ${message.message}")
             } else {
                 Log.d(TAG, "Host created ${message.displayWidth}x${message.displayHeight}")
             }
+            return message
         }
+        return null
     }
 
-    private suspend fun streamVideo(video: Socket, metrics: DeviceInfo.Metrics) {
+    private suspend fun streamVideo(video: Socket, width: Int, height: Int) {
         val stream = DataInputStream(video.getInputStream().buffered(1 shl 16))
-        initDecoder(metrics.widthPixels, metrics.heightPixels)
+        initDecoder(width, height)
 
         updateStatus("")
         setStatsVisible(showStats)
@@ -441,11 +448,15 @@ class MainActivity : AppCompatActivity() {
             decodeFrame(frame)
 
             frameCount++
+            byteCount += length
             val now = System.currentTimeMillis()
-            if (now - lastStatsAt >= 1000) {
-                val fps = frameCount * 1000.0 / (now - lastStatsAt)
-                updateStats("%.1f fps · %d KB".format(fps, length / 1024))
+            val elapsed = now - lastStatsAt
+            if (elapsed >= 1000) {
+                val fps = frameCount * 1000.0 / elapsed
+                val mbps = byteCount * 8.0 / elapsed / 1000.0
+                updateStats("%.1f fps · %.1f Mbps".format(fps, mbps))
                 frameCount = 0
+                byteCount = 0
                 lastStatsAt = now
             }
         }

@@ -54,6 +54,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var transport: TransportMode = .usb
     private var lastDeviceReady = false
 
+    /// `--start` begins streaming as soon as a device is ready, without
+    /// touching the menu. Used by tools/e2e-test.sh and handy for a kiosk-ish
+    /// setup where the Mac should just work when the tablet is plugged in.
+    private let autoStartRequested = CommandLine.arguments.contains("--start")
+    /// `--wireless` selects Wi-Fi mode at launch.
+    private let wirelessRequested = CommandLine.arguments.contains("--wireless")
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
@@ -78,8 +85,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         log("USB Tablet Display started")
         logStartupDiagnostics()
 
+        if wirelessRequested { transport = .wireless }
+
         adb.refreshDevices()
         rebuildMenu()
+
+        if autoStartRequested {
+            log("--start given; connecting as soon as a device is ready")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                if self.transport == .wireless || self.adb.selected != nil {
+                    self.startStreaming()
+                }
+            }
+        }
 
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.pollDevices() }
@@ -111,7 +130,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Seamlessness: once a device is trusted, plugging the cable in should
         // be the entire interaction. No taps, no menu.
-        if autoConnect && transport == .usb && ready && !lastDeviceReady && !session.isRunning {
+        if (autoConnect || autoStartRequested) && transport == .usb
+            && ready && !lastDeviceReady && !session.isRunning {
             log("Device appeared; connecting automatically")
             startStreaming()
         }
@@ -214,6 +234,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if session.isRunning && session.clientConnected {
             menu.addItem(disabled(String(format: "   %.0f fps · %.1f Mbps",
                                          session.stats.fps, session.stats.megabitsPerSecond)))
+            if session.stats.encodeMedianMs > 0 {
+                menu.addItem(disabled(String(format: "   encode %.1f ms (worst %.1f)",
+                                             session.stats.encodeMedianMs,
+                                             session.stats.encodeWorstMs)))
+            }
             if !session.stats.displaySize.isEmpty {
                 menu.addItem(disabled("   \(session.stats.displaySize)"))
             }
@@ -407,14 +432,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func pinDevice(_ sender: NSMenuItem) {
         adb.preferredSerial = sender.representedObject as? String
+        if wirelessRequested { transport = .wireless }
+
         adb.refreshDevices()
         rebuildMenu()
+
+        if autoStartRequested {
+            log("--start given; connecting as soon as a device is ready")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                if self.transport == .wireless || self.adb.selected != nil {
+                    self.startStreaming()
+                }
+            }
+        }
     }
 
     @objc private func unpinDevice() {
         adb.preferredSerial = nil
+        if wirelessRequested { transport = .wireless }
+
         adb.refreshDevices()
         rebuildMenu()
+
+        if autoStartRequested {
+            log("--start given; connecting as soon as a device is ready")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self else { return }
+                if self.transport == .wireless || self.adb.selected != nil {
+                    self.startStreaming()
+                }
+            }
+        }
     }
 
     @objc private func confirmPairing() {
