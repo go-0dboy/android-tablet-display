@@ -6,6 +6,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.MotionEvent
@@ -13,13 +16,16 @@ import android.view.SurfaceHolder
 import android.view.View
 import android.view.WindowManager
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.lifecycleScope
 import com.usbtablet.display.databinding.ActivityMainBinding
 import kotlinx.coroutines.*
 import java.io.DataInputStream
-import java.io.DataOutputStream
 import java.io.EOFException
-import java.net.ConnectException
+import java.io.OutputStream
+import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -28,58 +34,46 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val TAG = "USBDisplay"
-        private const val HOST = "127.0.0.1"  // localhost via ADB port forward
-        private const val VIDEO_PORT = 5560
-        private const val TOUCH_PORT = 5561
+        /** Over USB the host is reachable on loopback via `adb reverse`. */
+        private const val USB_HOST = "127.0.0.1"
+        private const val CONNECT_TIMEOUT_MS = 10_000
+        private const val READ_TIMEOUT_MS = 20_000
+        private const val RECONNECT_DELAY_MS = 800L
+        private const val SERVICE_TYPE = "_usbtablet._tcp."
 
-        private const val VIDEO_WIDTH = 2560
-        private const val VIDEO_HEIGHT = 1600
-
-        // Longer timeouts for better resilience
-        private const val CONNECT_TIMEOUT_MS = 10000
-        private const val READ_TIMEOUT_MS = 30000  // 30 seconds - give server time to start capture
-        private const val RECONNECT_DELAY_MS = 1000L
-
-        // Touch event types
-        private const val TOUCH_DOWN: Byte = 0
-        private const val TOUCH_MOVE: Byte = 1
-        private const val TOUCH_UP: Byte = 2
-
-        // Pen/stylus event types (with pressure/tilt)
-        private const val PEN_DOWN: Byte = 10
-        private const val PEN_MOVE: Byte = 11
-        private const val PEN_UP: Byte = 12
-        private const val PEN_HOVER: Byte = 13  // Hovering without touching
+        const val ACTION_SET_TOUCH_MODE = "com.usbtablet.display.SET_TOUCH_MODE"
+        const val ACTION_SHOW_FPS = "com.usbtablet.display.SHOW_FPS"
+        const val ACTION_HIDE_FPS = "com.usbtablet.display.HIDE_FPS"
     }
 
     private lateinit var binding: ActivityMainBinding
+
     private var decoder: MediaCodec? = null
     private var videoSocket: Socket? = null
-    private var touchSocket: Socket? = null
-    private var touchOutputStream: DataOutputStream? = null
-    private var isRunning = AtomicBoolean(false)
-    private var frameCount = 0
-    private var lastStatsTime = System.currentTimeMillis()
-    private var connectionAttempts = 0
-    private var showStats = true  // Toggle for FPS display
+    private var inputSocket: Socket? = null
+    private var inputOut: OutputStream? = null
+    private val running = AtomicBoolean(false)
 
-    // Broadcast receiver for FPS toggle from macOS host
-    private val fpsToggleReceiver = object : BroadcastReceiver() {
+    private val translator = TouchTranslator()
+    private var showStats = true
+    private var wirelessMode = false
+    private var hostAddress: String? = null
+    private var videoPort = WireProtocol.DEFAULT_VIDEO_PORT
+    private var inputPort = WireProtocol.DEFAULT_INPUT_PORT
+
+    private var frameCount = 0
+    private var lastStatsAt = System.currentTimeMillis()
+    private var decoderWidth = 0
+    private var decoderHeight = 0
+
+    private val settingsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             when (intent?.action) {
-                "com.usbtablet.display.SHOW_FPS" -> {
-                    showStats = true
-                    runOnUiThread {
-                        if (isRunning.get()) {
-                            binding.statsText.visibility = View.VISIBLE
-                        }
-                    }
-                }
-                "com.usbtablet.display.HIDE_FPS" -> {
-                    showStats = false
-                    runOnUiThread {
-                        binding.statsText.visibility = View.GONE
-                    }
+                ACTION_SHOW_FPS -> setStatsVisible(true)
+                ACTION_HIDE_FPS -> setStatsVisible(false)
+                ACTION_SET_TOUCH_MODE -> {
+                    translator.touchMode = TouchMode.from(intent.getStringExtra("mode"))
+                    Log.d(TAG, "Touch mode: ${translator.touchMode}")
                 }
             }
         }
@@ -87,166 +81,160 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        // Keep screen on
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-        // Immersive fullscreen
-        hideSystemUI()
 
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
+        goFullscreen()
 
-        // Set up touch listener on the surface view
+        wirelessMode = intent.getBooleanExtra("wireless", false)
+
         binding.surfaceView.setOnTouchListener { view, event ->
-            handleTouch(view, event)
-            true
+            handleMotion(view, event); true
         }
-
-        // Set up hover listener for stylus hover events
         binding.surfaceView.setOnHoverListener { view, event ->
-            handleTouch(view, event)
-            true
+            handleMotion(view, event); true
         }
+        binding.statsText.setOnClickListener { setStatsVisible(!showStats) }
 
-        // Tap stats to toggle visibility
-        binding.statsText.setOnClickListener {
-            showStats = !showStats
-            binding.statsText.visibility = if (showStats) View.VISIBLE else View.GONE
-        }
-
-        // Register broadcast receiver for FPS toggle
         val filter = IntentFilter().apply {
-            addAction("com.usbtablet.display.SHOW_FPS")
-            addAction("com.usbtablet.display.HIDE_FPS")
+            addAction(ACTION_SHOW_FPS)
+            addAction(ACTION_HIDE_FPS)
+            addAction(ACTION_SET_TOUCH_MODE)
         }
-        registerReceiver(fpsToggleReceiver, filter, RECEIVER_EXPORTED)
+        // The host sends these through `adb shell am broadcast`, which runs as
+        // a different uid, so the receiver has to be exported. It is targeted
+        // at this package (-p) on the sending side and carries no data worth
+        // spoofing.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(settingsReceiver, filter, RECEIVER_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(settingsReceiver, filter)
+        }
 
         binding.surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                Log.d(TAG, "Surface created")
-                startStreaming()
-            }
-
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-                Log.d(TAG, "Surface changed: ${width}x${height}")
-            }
-
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                Log.d(TAG, "Surface destroyed")
-                stopStreaming()
-            }
+            override fun surfaceCreated(holder: SurfaceHolder) = start()
+            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, ht: Int) {}
+            override fun surfaceDestroyed(holder: SurfaceHolder) = stop()
         })
+
+        if (DeviceInfo.isDeXActive(this)) {
+            Log.w(TAG, "Samsung DeX is active; the stream may be interrupted")
+        }
     }
 
-    private fun handleTouch(view: View, event: MotionEvent) {
-        val outputStream = touchOutputStream ?: return
+    private fun goFullscreen() {
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        WindowInsetsControllerCompat(window, binding.root).apply {
+            hide(WindowInsetsCompat.Type.systemBars())
+            systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+    }
 
-        // Convert view coordinates to normalized (0-1) coordinates
-        val normalizedX = event.x / view.width
-        val normalizedY = event.y / view.height
+    // MARK: - Input
 
-        // Check if this is a stylus/pen event
-        val isStylus = event.getToolType(0) == MotionEvent.TOOL_TYPE_STYLUS
+    /**
+     * Convert a MotionEvent into normalised samples and hand them to the
+     * translator.
+     *
+     * The v1 bug lived here: it switched on `event.action`, but
+     * ACTION_POINTER_DOWN/UP pack the pointer index into the high bits, so
+     * those branches never matched and multi-touch never worked.
+     */
+    private fun handleMotion(view: View, event: MotionEvent) {
+        val out = inputOut ?: return
+        if (view.width <= 0 || view.height <= 0) return
 
-        val touchType: Byte
-        val isPenHover: Boolean
+        val shortEdge = minOf(view.width, view.height).toFloat()
 
-        if (isStylus) {
-            // Stylus events - check for hover (buttonState or no pressure indicates hover)
-            val isHovering = event.pressure == 0f ||
-                (event.action == MotionEvent.ACTION_HOVER_ENTER ||
-                 event.action == MotionEvent.ACTION_HOVER_MOVE ||
-                 event.action == MotionEvent.ACTION_HOVER_EXIT)
-
-            isPenHover = isHovering
-            touchType = when (event.action) {
-                MotionEvent.ACTION_DOWN -> PEN_DOWN
-                MotionEvent.ACTION_MOVE -> PEN_MOVE
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> PEN_UP
-                MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> PEN_HOVER
-                MotionEvent.ACTION_HOVER_EXIT -> PEN_UP
-                else -> return
+        fun sample(index: Int): PointerSample {
+            val tool = when (event.getToolType(index)) {
+                MotionEvent.TOOL_TYPE_STYLUS -> ToolType.STYLUS
+                MotionEvent.TOOL_TYPE_ERASER -> ToolType.ERASER
+                MotionEvent.TOOL_TYPE_FINGER -> ToolType.FINGER
+                else -> ToolType.OTHER
             }
-        } else {
-            // Regular finger touch
-            isPenHover = false
-            touchType = when (event.action) {
-                MotionEvent.ACTION_DOWN -> TOUCH_DOWN
-                MotionEvent.ACTION_MOVE -> TOUCH_MOVE
-                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> TOUCH_UP
-                else -> return
-            }
+            return PointerSample(
+                pointerId = event.getPointerId(index),
+                tool = tool,
+                x = (event.getX(index) / view.width).coerceIn(0f, 1f),
+                y = (event.getY(index) / view.height).coerceIn(0f, 1f),
+                pressure = event.getPressure(index),
+                tiltRadians = event.getAxisValue(MotionEvent.AXIS_TILT, index),
+                orientationRadians = event.getOrientation(index),
+                sizeFraction = event.getTouchMajor(index) / shortEdge
+            )
         }
 
-        // Get pressure and tilt for stylus
-        val pressure = if (isStylus && !isPenHover) event.pressure.coerceIn(0f, 1f) else 0f
-        val tiltX = if (isStylus) event.getAxisValue(MotionEvent.AXIS_TILT) else 0f
-        val tiltY = if (isStylus) event.getAxisValue(MotionEvent.AXIS_ORIENTATION) else 0f
+        val actionIndex = event.actionIndex
+        val phase = when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> Phase.DOWN
+            MotionEvent.ACTION_MOVE -> Phase.MOVE
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> Phase.UP
+            MotionEvent.ACTION_CANCEL -> Phase.CANCEL
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> Phase.HOVER
+            MotionEvent.ACTION_HOVER_EXIT -> Phase.HOVER_END
+            else -> return
+        }
 
-        // Send touch event asynchronously
+        // On a pointer-up the lifted contact is still in the event, so drop it
+        // from the "currently down" set or a two-finger gesture never ends.
+        val liftingIndex = if (event.actionMasked == MotionEvent.ACTION_POINTER_UP)
+            actionIndex else -1
+        val pointers = (0 until event.pointerCount)
+            .filter { it != liftingIndex }
+            .map { sample(it) }
+
+        val changed = sample(actionIndex.coerceIn(0, event.pointerCount - 1))
+
+        // The S Pen's barrel button arrives as a secondary button press.
+        val barrel = event.buttonState and
+            (MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY) != 0
+
+        val messages = translator.translate(pointers, phase, changed)
+        if (messages.isEmpty()) return
+
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                synchronized(outputStream) {
-                    if (isStylus) {
-                        // Pen protocol: type (1) + x (4) + y (4) + pressure (4) + tiltX (4) + tiltY (4) = 21 bytes
-                        outputStream.writeByte(touchType.toInt())
-                        outputStream.writeFloat(normalizedX)
-                        outputStream.writeFloat(normalizedY)
-                        outputStream.writeFloat(pressure)
-                        outputStream.writeFloat(tiltX)
-                        outputStream.writeFloat(tiltY)
-                    } else {
-                        // Touch protocol: type (1 byte) + x (4 bytes float) + y (4 bytes float) = 9 bytes
-                        outputStream.writeByte(touchType.toInt())
-                        outputStream.writeFloat(normalizedX)
-                        outputStream.writeFloat(normalizedY)
+                synchronized(out) {
+                    for (message in messages) {
+                        val toSend = if (message is OutgoingMessage.Pen && barrel) {
+                            message.copy(buttons = message.buttons or 0x01)
+                        } else message
+                        out.write(InputCodec.encode(toSend))
                     }
-                    outputStream.flush()
+                    out.flush()
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Failed to send touch event", e)
+                Log.w(TAG, "Could not send input", e)
             }
         }
     }
 
-    private fun hideSystemUI() {
-        @Suppress("DEPRECATION")
-        window.decorView.systemUiVisibility = (
-            View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-            or View.SYSTEM_UI_FLAG_LAYOUT_STABLE
-            or View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-            or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-            or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
-            or View.SYSTEM_UI_FLAG_FULLSCREEN
-        )
-    }
+    // MARK: - Connection
 
-    private fun startStreaming() {
-        isRunning.set(true)
-        connectionAttempts = 0
-
+    private fun start() {
+        running.set(true)
         lifecycleScope.launch(Dispatchers.IO) {
-            while (isRunning.get()) {
-                connectionAttempts++
+            while (running.get()) {
                 try {
-                    updateStatus("Waiting for macOS host...")
+                    if (wirelessMode && hostAddress == null) {
+                        updateStatus("Looking for a Mac on this network…")
+                        discoverHost()
+                        if (hostAddress == null) { delay(2000); continue }
+                    }
                     connectAndStream()
-                } catch (e: ConnectException) {
-                    Log.w(TAG, "Connection refused (attempt $connectionAttempts)", e)
-                    updateStatus("Waiting for macOS host...")
-                    delay(RECONNECT_DELAY_MS)
-                } catch (e: SocketTimeoutException) {
-                    Log.w(TAG, "Socket timeout (attempt $connectionAttempts)", e)
-                    updateStatus("Waiting for macOS host...")
-                    delay(RECONNECT_DELAY_MS)
-                } catch (e: EOFException) {
-                    Log.w(TAG, "Server closed connection", e)
-                    updateStatus("Reconnecting...")
-                    delay(RECONNECT_DELAY_MS)
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
-                    Log.e(TAG, "Connection error (attempt $connectionAttempts)", e)
-                    updateStatus("Waiting for macOS host...")
+                    Log.w(TAG, "Connection ended: ${e.message}")
+                    updateStatus(waitingMessage())
                     delay(RECONNECT_DELAY_MS)
                 } finally {
                     closeConnection()
@@ -255,212 +243,307 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun stopStreaming() {
-        isRunning.set(false)
+    private fun waitingMessage(): String =
+        if (wirelessMode) "Looking for a Mac on this network…"
+        else "Waiting for the Mac…\nStart the app on your Mac and plug in the cable."
+
+    private fun stop() {
+        running.set(false)
+        translator.reset()
         closeConnection()
     }
 
-    private fun closeConnection() {
-        try {
-            touchOutputStream = null
-            touchSocket?.close()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error closing touch socket", e)
+    private suspend fun discoverHost() = withContext(Dispatchers.IO) {
+        val nsd = getSystemService(Context.NSD_SERVICE) as NsdManager
+        val found = CompletableDeferred<NsdServiceInfo?>()
+
+        val listener = object : NsdManager.DiscoveryListener {
+            override fun onDiscoveryStarted(type: String) {}
+            override fun onServiceFound(service: NsdServiceInfo) {
+                @Suppress("DEPRECATION")
+                nsd.resolveService(service, object : NsdManager.ResolveListener {
+                    override fun onResolveFailed(info: NsdServiceInfo, code: Int) {}
+                    override fun onServiceResolved(info: NsdServiceInfo) {
+                        if (!found.isCompleted) found.complete(info)
+                    }
+                })
+            }
+            override fun onServiceLost(service: NsdServiceInfo) {}
+            override fun onDiscoveryStopped(type: String) {}
+            override fun onStartDiscoveryFailed(type: String, code: Int) {
+                if (!found.isCompleted) found.complete(null)
+            }
+            override fun onStopDiscoveryFailed(type: String, code: Int) {}
         }
-        touchSocket = null
 
         try {
-            videoSocket?.close()
+            nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, listener)
+            val info = withTimeoutOrNull(8000) { found.await() }
+            if (info != null) {
+                @Suppress("DEPRECATION")
+                hostAddress = info.host?.hostAddress
+                @Suppress("DEPRECATION")
+                videoPort = info.port
+                inputPort = info.attributes["input"]
+                    ?.toString(Charsets.UTF_8)?.toIntOrNull() ?: (videoPort + 1)
+                Log.d(TAG, "Found host at $hostAddress:$videoPort")
+            }
         } catch (e: Exception) {
-            Log.w(TAG, "Error closing video socket", e)
+            Log.w(TAG, "Discovery failed", e)
+        } finally {
+            try { nsd.stopServiceDiscovery(listener) } catch (_: Exception) {}
         }
-        videoSocket = null
-        releaseDecoder()
     }
 
     private suspend fun connectAndStream() {
-        // Connect to the macOS host via ADB reverse port forward
-        Log.d(TAG, "Connecting to video stream at $HOST:$VIDEO_PORT")
+        val host = if (wirelessMode) (hostAddress ?: return) else USB_HOST
+        updateStatus(waitingMessage())
 
-        videoSocket = Socket().apply {
-            soTimeout = READ_TIMEOUT_MS
+        val video = Socket().apply {
             tcpNoDelay = true
-            connect(java.net.InetSocketAddress(HOST, VIDEO_PORT), CONNECT_TIMEOUT_MS)
+            soTimeout = READ_TIMEOUT_MS
+            connect(InetSocketAddress(host, videoPort), CONNECT_TIMEOUT_MS)
+        }
+        videoSocket = video
+
+        val input = Socket().apply {
+            tcpNoDelay = true
+            soTimeout = READ_TIMEOUT_MS
+            connect(InetSocketAddress(host, inputPort), CONNECT_TIMEOUT_MS)
+        }
+        inputSocket = input
+        val out = input.getOutputStream()
+        val parser = InputStreamParser()
+        val inStream = input.getInputStream()
+
+        updateStatus("Connecting…")
+
+        if (wirelessMode && !authenticate(out, inStream, parser)) {
+            updateStatus("Not paired.\nConfirm the code on your Mac.")
+            delay(3000)
+            throw Exception("not paired")
         }
 
-        Log.d(TAG, "Video connected! Connecting touch channel...")
-        updateStatus("Connecting...")
+        // Tell the host what panel it is drawing onto, so it can build a
+        // display that matches instead of guessing.
+        val metrics = DeviceInfo.metrics(this@MainActivity)
+        val hello = OutgoingMessage.Hello(
+            widthPixels = metrics.widthPixels,
+            heightPixels = metrics.heightPixels,
+            densityDpi = metrics.densityDpi,
+            rotationDegrees = metrics.rotationDegrees,
+            flags = DeviceInfo.flags(this@MainActivity,
+                                     translator.touchMode == TouchMode.PEN_ONLY),
+            deviceName = DeviceInfo.displayName()
+        )
+        synchronized(out) { out.write(InputCodec.encode(hello)); out.flush() }
+        inputOut = out
+        Log.d(TAG, "Sent hello: ${metrics.widthPixels}x${metrics.heightPixels} " +
+                   "@${metrics.densityDpi}dpi")
 
-        // Connect touch channel
-        try {
-            touchSocket = Socket().apply {
-                tcpNoDelay = true
-                connect(java.net.InetSocketAddress(HOST, TOUCH_PORT), CONNECT_TIMEOUT_MS)
-            }
-            touchOutputStream = DataOutputStream(touchSocket!!.getOutputStream())
-            Log.d(TAG, "Touch channel connected!")
-        } catch (e: Exception) {
-            Log.w(TAG, "Touch channel not available (touch will be disabled)", e)
-            // Continue without touch - video still works
+        // Read the ack on a side coroutine so video can start immediately.
+        val ackJob = lifecycleScope.launch(Dispatchers.IO) {
+            readAck(inStream, parser)
         }
 
-        updateStatus("Starting stream...")
+        updateStatus("Starting…")
+        streamVideo(video, metrics)
+        ackJob.cancel()
+    }
 
-        val inputStream = DataInputStream(videoSocket!!.getInputStream())
+    /** Pair (or prove we are already paired) before any pixels are sent. */
+    private suspend fun authenticate(
+        out: OutputStream, inStream: java.io.InputStream, parser: InputStreamParser
+    ): Boolean {
+        val clientKey = ClientPairing.identity(this)
+        val clientNonce = ClientPairing.nonce()
 
-        // Initialize decoder
-        initDecoder()
+        synchronized(out) {
+            out.write(InputCodec.encode(OutgoingMessage.PairRequest(
+                clientKey, clientNonce, DeviceInfo.displayName())))
+            out.flush()
+        }
 
-        // Reset connection attempts on successful connection
-        connectionAttempts = 0
+        val response = readMessage(inStream, parser, 10_000)
+            as? IncomingMessage.PairResponse ?: return false
 
-        updateStatus("")  // Hide status text
-        showStats(true)
+        if (response.status == PairStatus.REJECTED) {
+            updateStatus("This Mac is not accepting wireless devices.")
+            return false
+        }
 
-        // Read and decode frames
-        var framesReceived = 0
-        while (isRunning.get() && videoSocket?.isConnected == true) {
-            try {
-                // Read frame length (4 bytes, big endian)
-                val length = inputStream.readInt()
+        if (response.status == PairStatus.NEEDS_CONFIRMATION) {
+            val code = ClientPairing.shortCode(
+                clientNonce, response.hostNonce, clientKey, response.hostKey)
+            updateStatus("Pairing code\n\n$code\n\nConfirm this on “${response.hostName}”.")
+        }
 
-                if (length <= 0 || length > 10_000_000) {
-                    Log.w(TAG, "Invalid frame length: $length, skipping")
-                    continue
-                }
+        val proof = ClientPairing.sessionProof(clientKey, clientNonce, response.hostNonce)
+        synchronized(out) {
+            out.write(InputCodec.encode(OutgoingMessage.PairProof(proof)))
+            out.flush()
+        }
 
-                // Read frame data
-                val frameData = ByteArray(length)
-                inputStream.readFully(frameData)
+        // The person may take a moment to press the button on the Mac.
+        val result = readMessage(inStream, parser, 60_000) as? IncomingMessage.PairResult
+        return result?.accepted == true
+    }
 
-                framesReceived++
-                if (framesReceived == 1) {
-                    Log.d(TAG, "First frame received! Size: $length bytes")
-                }
+    private fun readMessage(
+        inStream: java.io.InputStream, parser: InputStreamParser, timeoutMs: Int
+    ): IncomingMessage? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val buffer = ByteArray(2048)
+        while (System.currentTimeMillis() < deadline) {
+            parser.next()?.let { return it }
+            val read = try { inStream.read(buffer) } catch (_: SocketTimeoutException) { 0 }
+            if (read < 0) return null
+            if (read > 0) parser.append(buffer, read)
+        }
+        return null
+    }
 
-                // Decode frame
-                decodeFrame(frameData)
-
-                // Update stats
-                frameCount++
-                val now = System.currentTimeMillis()
-                if (now - lastStatsTime >= 1000) {
-                    val fps = frameCount * 1000.0 / (now - lastStatsTime)
-                    updateStats("${String.format("%.1f", fps)} fps | ${length / 1024} KB")
-                    frameCount = 0
-                    lastStatsTime = now
-                }
-
-            } catch (e: SocketTimeoutException) {
-                // Read timeout - check if we should continue
-                Log.d(TAG, "Read timeout, checking connection...")
-                if (!isRunning.get()) break
-                // Continue waiting if still running
-            } catch (e: EOFException) {
-                Log.d(TAG, "End of stream")
-                throw e
-            } catch (e: Exception) {
-                if (isRunning.get()) {
-                    throw e
-                }
+    private fun readAck(inStream: java.io.InputStream, parser: InputStreamParser) {
+        val message = readMessage(inStream, parser, 15_000)
+        if (message is IncomingMessage.HelloAck) {
+            if (!message.accepted) {
+                Log.w(TAG, "Host refused the display: ${message.message}")
+            } else {
+                Log.d(TAG, "Host created ${message.displayWidth}x${message.displayHeight}")
             }
         }
     }
 
-    private fun initDecoder() {
+    private suspend fun streamVideo(video: Socket, metrics: DeviceInfo.Metrics) {
+        val stream = DataInputStream(video.getInputStream().buffered(1 shl 16))
+        initDecoder(metrics.widthPixels, metrics.heightPixels)
+
+        updateStatus("")
+        setStatsVisible(showStats)
+
+        while (running.get() && !video.isClosed) {
+            val length = try {
+                stream.readInt()
+            } catch (e: SocketTimeoutException) {
+                if (!running.get()) break else continue
+            } catch (e: EOFException) {
+                throw e
+            }
+
+            if (!VideoFraming.isPlausibleFrameLength(length)) {
+                // The stream is unrecoverable at this point: reconnect rather
+                // than limp along on garbage.
+                throw Exception("implausible frame length $length")
+            }
+
+            val frame = ByteArray(length)
+            stream.readFully(frame)
+            decodeFrame(frame)
+
+            frameCount++
+            val now = System.currentTimeMillis()
+            if (now - lastStatsAt >= 1000) {
+                val fps = frameCount * 1000.0 / (now - lastStatsAt)
+                updateStats("%.1f fps · %d KB".format(fps, length / 1024))
+                frameCount = 0
+                lastStatsAt = now
+            }
+        }
+    }
+
+    // MARK: - Decoder
+
+    private fun initDecoder(width: Int, height: Int) {
+        if (decoder != null && decoderWidth == width && decoderHeight == height) return
+        releaseDecoder()
         try {
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_WIDTH, VIDEO_HEIGHT)
-            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, VIDEO_WIDTH * VIDEO_HEIGHT)
-
-            // Low latency settings
-            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-
-            decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            decoder?.configure(format, binding.surfaceView.holder.surface, null, 0)
-            decoder?.start()
-
-            Log.d(TAG, "Decoder initialized: ${VIDEO_WIDTH}x${VIDEO_HEIGHT}")
+            val format = MediaFormat.createVideoFormat(
+                MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height)
+                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+                // Samsung's decoder honours this vendor key on One UI even
+                // when the standard one is ignored; setting both is harmless.
+                setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+            }
+            decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+                configure(format, binding.surfaceView.holder.surface, null, 0)
+                start()
+            }
+            decoderWidth = width
+            decoderHeight = height
+            Log.d(TAG, "Decoder ready at ${width}x$height")
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize decoder", e)
+            Log.e(TAG, "Could not start the decoder", e)
         }
     }
 
     private fun releaseDecoder() {
-        try {
-            decoder?.stop()
-            decoder?.release()
-        } catch (e: Exception) {
-            Log.w(TAG, "Error releasing decoder", e)
-        }
+        try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
         decoder = null
+        decoderWidth = 0
+        decoderHeight = 0
     }
 
     private fun decodeFrame(data: ByteArray) {
-        val decoder = decoder ?: return
-
+        val codec = decoder ?: return
         try {
-            // Get input buffer with timeout
-            val inputIndex = decoder.dequeueInputBuffer(10000)
+            val inputIndex = codec.dequeueInputBuffer(10_000)
             if (inputIndex >= 0) {
-                val inputBuffer = decoder.getInputBuffer(inputIndex)
-                inputBuffer?.clear()
-                inputBuffer?.put(data)
-
-                decoder.queueInputBuffer(inputIndex, 0, data.size, 0, 0)
+                codec.getInputBuffer(inputIndex)?.apply { clear(); put(data) }
+                codec.queueInputBuffer(inputIndex, 0, data.size, 0, 0)
             }
-
-            // Get output buffer
-            val bufferInfo = MediaCodec.BufferInfo()
-            var outputIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
-
+            val info = MediaCodec.BufferInfo()
+            var outputIndex = codec.dequeueOutputBuffer(info, 0)
             while (outputIndex >= 0) {
-                // Release the buffer to render to surface
-                decoder.releaseOutputBuffer(outputIndex, true)
-                outputIndex = decoder.dequeueOutputBuffer(bufferInfo, 0)
+                codec.releaseOutputBuffer(outputIndex, true)
+                outputIndex = codec.dequeueOutputBuffer(info, 0)
             }
-
-        } catch (e: Exception) {
-            Log.e(TAG, "Decode error", e)
+        } catch (e: IllegalStateException) {
+            Log.e(TAG, "Decoder fell over; restarting it", e)
+            releaseDecoder()
         }
     }
 
-    private suspend fun updateStatus(text: String) {
-        withContext(Dispatchers.Main) {
+    private fun closeConnection() {
+        inputOut = null
+        translator.reset()
+        try { inputSocket?.close() } catch (_: Exception) {}
+        try { videoSocket?.close() } catch (_: Exception) {}
+        inputSocket = null
+        videoSocket = null
+        releaseDecoder()
+    }
+
+    // MARK: - UI
+
+    private fun updateStatus(text: String) {
+        runOnUiThread {
             binding.statusText.text = text
-            binding.statusContainer.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
-            binding.progressBar.visibility = if (text.isEmpty()) View.GONE else View.VISIBLE
+            val visible = text.isNotEmpty()
+            binding.statusContainer.visibility = if (visible) View.VISIBLE else View.GONE
+            binding.progressBar.visibility = if (visible) View.VISIBLE else View.GONE
         }
     }
 
-    private suspend fun showStats(show: Boolean) {
-        withContext(Dispatchers.Main) {
-            // Only show if both streaming AND user hasn't hidden it
-            binding.statsText.visibility = if (show && showStats) View.VISIBLE else View.GONE
-            // Hide status container when streaming
-            if (show) {
-                binding.statusContainer.visibility = View.GONE
-            }
-        }
+    private fun updateStats(text: String) {
+        runOnUiThread { binding.statsText.text = text }
     }
 
-    private suspend fun updateStats(text: String) {
-        withContext(Dispatchers.Main) {
-            binding.statsText.text = text
+    private fun setStatsVisible(visible: Boolean) {
+        showStats = visible
+        runOnUiThread {
+            binding.statsText.visibility = if (visible) View.VISIBLE else View.GONE
         }
     }
 
     override fun onResume() {
         super.onResume()
-        hideSystemUI()
+        goFullscreen()
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        try {
-            unregisterReceiver(fpsToggleReceiver)
-        } catch (e: Exception) {
-            // Receiver may not be registered
-        }
-        stopStreaming()
+        try { unregisterReceiver(settingsReceiver) } catch (_: Exception) {}
+        stop()
     }
 }

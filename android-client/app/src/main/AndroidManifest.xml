@@ -2,6 +2,16 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Wireless mode only: Bonjour discovery of the Mac on the local network. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- Pen pressure and tilt are the point of this app; a device without a
+         stylus still works with touch, so this is not required. -->
+    <uses-feature android:name="android.hardware.type.stylus" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen.multitouch"
+        android:required="false" />
 
     <application
         android:allowBackup="true"
@@ -12,7 +22,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode"
             android:screenOrientation="landscape"
             android:theme="@style/Theme.USBDisplay.Fullscreen">
             <intent-filter>
