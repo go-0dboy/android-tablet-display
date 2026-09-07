@@ -60,9 +60,14 @@ has never been run against the hardware it is for.
 - **Anything involving a real Samsung device.** USB throughput and latency over
   an actual cable, One UI's USB mode handling, whether `adb reverse` behaves the
   same on One UI as on the emulator.
-- **The S Pen.** Pressure, tilt, hover, the barrel button and the eraser end are
-  implemented and the translation logic is unit-tested, but no stylus has ever
-  been put to a screen with this code running. The emulator has no digitiser.
+- **Any real stylus.** Pressure, tilt, hover, the barrel button and the eraser
+  end are implemented and the translation logic is unit-tested, but no stylus
+  has ever been put to a screen with this code running. The emulator has no
+  digitiser. The intended target is a **Wacom MovinkPad Pro 14**, a standalone
+  Android tablet with a Wacom EMR digitiser — see
+  [WACOM-MOVINK.md](WACOM-MOVINK.md). What its digitiser actually reports is
+  unrecorded; `./tools/pen-probe.sh <serial>` is the tool that answers it, and
+  its output should be pasted here once someone has run it.
 - **Palm rejection.** The rules are tested against synthetic input. Whether the
   size threshold is right for a real hand on real glass is unknown.
 - **Whether macOS applications actually honour the pen.** The host now sends

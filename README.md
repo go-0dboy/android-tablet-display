@@ -26,7 +26,9 @@ changes.
 - **Auto-connect**: once trusted, plugging the cable in is the whole interaction.
 - **Wireless mode** (Wi-Fi, Bonjour discovery, six-digit pairing) — see
   [docs/WIRELESS.md](docs/WIRELESS.md).
-- **Wacom pen display presets** — see [docs/WACOM-MOVINK.md](docs/WACOM-MOVINK.md).
+- **Wacom**: a MovinkPad Pro 14 is a streaming target like any other Android
+  tablet; a Movink 13 pen display is a monitor and needs layout presets, not
+  streaming. Both covered in [docs/WACOM-MOVINK.md](docs/WACOM-MOVINK.md).
 
 ## Architecture
 

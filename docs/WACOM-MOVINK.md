@@ -1,4 +1,11 @@
-# The Wacom Movink, and what this project can and cannot do for it
+# The two Wacom "Movink" products, and what this project does with each
+
+> **If you are here for the MovinkPad Pro 14, skip to
+> [the MovinkPad section](#the-movinkpad-pro-14-a-streaming-target).** It is a
+> standalone Android tablet, so it is a *client* for this project — the
+> Android app installs on it and it becomes a Mac display. The rest of this
+> page is about the Movink 13 pen display, which is a different product that
+> needs the opposite treatment.
 
 ## First: the name
 
@@ -13,6 +20,50 @@ confused, and they need opposite things from this project:
 If the goal is "use it as an extra Mac screen with pen support", those are two
 completely different paths. Worth checking which one is actually on the desk
 before following either.
+
+## The MovinkPad Pro 14: a streaming target
+
+The MovinkPad Pro 14 is a **standalone Android tablet** with a Wacom EMR
+digitiser — the same electromagnetic-resonance technology as Wacom's pen
+displays, with a battery-free pen. It runs its own Android, so it is not a
+monitor and macOS cannot draw to it directly.
+
+That makes it exactly what this project is for. Install the Android client on
+it and it becomes a Mac display with pen pressure and tilt:
+
+```bash
+cd android-client && ./gradlew assembleDebug
+adb -s <serial> install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+Then the normal flow in [STATUS.md](STATUS.md): USB debugging on, cable in,
+start the Mac app.
+
+**Nothing in this project is specific to it.** It is treated like any other
+Android tablet: the client reports its resolution and density, the host builds
+a display to match. A Wacom EMR digitiser is a better pen than most — that is
+the point of the hardware — but from Android's side it is still a
+`TOOL_TYPE_STYLUS` reporting `AXIS_PRESSURE` and `AXIS_TILT`, which is what the
+client already reads.
+
+**Wacom's macOS driver is irrelevant here.** It drives Wacom hardware attached
+to a Mac; the MovinkPad's digitiser is attached to its own Android. Do not
+install it for this.
+
+### Confirming what its digitiser actually sends
+
+EMR digitiser behaviour is not documented in any way that can be relied on —
+which axes are populated, the pressure range, whether tilt is reported at all,
+and whether the side buttons arrive as `BUTTON_STYLUS_PRIMARY` or
+`BUTTON_SECONDARY` all vary. So ask the hardware:
+
+```bash
+./tools/pen-probe.sh <serial>
+```
+
+That turns on the client's pen diagnostics over adb and tails the log while you
+hover, draw, tilt and press the buttons. The real axis names and ranges belong
+in [STATUS.md](STATUS.md) once someone has run it.
 
 Sources: [Wacom Movink product page](https://www.wacom.com/en-us/products/pen-displays/wacom-movink),
 and Wacom's own macOS driver notes, which list "Wacom Movink 13 DTH135" and
