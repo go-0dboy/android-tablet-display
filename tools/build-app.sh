@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build USB Tablet Display.app.
+# Build Android Tablet Display.app.
 #
 # Why a bundle and not just `swift build`: macOS attaches Screen Recording and
 # Accessibility permission to an application's bundle identity. A bare SwiftPM
@@ -11,7 +11,7 @@
 #   ./tools/build-app.sh            debug build
 #   ./tools/build-app.sh release    optimised build
 #
-# The result is build/USB Tablet Display.app — drag it to /Applications.
+# The result is build/Android Tablet Display.app — drag it to /Applications.
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ CONFIGURATION="${1:-debug}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PACKAGE="$ROOT/macos-host/USBDisplayApp"
 OUTPUT="$ROOT/build"
-APP="$OUTPUT/USB Tablet Display.app"
+APP="$OUTPUT/Android Tablet Display.app"
 
 # Build outside the checkout. SwiftPM keeps its build state in a SQLite
 # database, and SQLite does not survive being written inside a folder that a
@@ -50,9 +50,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>USB Tablet Display</string>
+    <string>Android Tablet Display</string>
     <key>CFBundleDisplayName</key>
-    <string>USB Tablet Display</string>
+    <string>Android Tablet Display</string>
     <key>CFBundleIdentifier</key>
     <string>dev.notinept.usbtabletdisplay</string>
     <key>CFBundleExecutable</key>

@@ -53,7 +53,7 @@ final class PenDisplayTests: XCTestCase {
 
     func testOurOwnVirtualDisplayIsNotAPenDisplay() {
         let identity = DisplayIdentity(vendorNumber: 0x1234, modelNumber: 0x5678,
-                                       name: "USB Tablet Display",
+                                       name: "Android Tablet Display",
                                        pixelWidth: 2560, pixelHeight: 1600)
         XCTAssertEqual(PenDisplayIdentifier.classify(identity), .virtualDisplay)
         XCTAssertFalse(PenDisplayIdentifier.classify(identity).isPenDisplay)

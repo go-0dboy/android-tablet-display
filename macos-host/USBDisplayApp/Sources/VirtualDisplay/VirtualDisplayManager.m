@@ -22,7 +22,7 @@
     spec.ppi = ppi > 0 ? ppi : 110;
     spec.hiDPI = hiDPI;
     spec.refreshRate = refreshRate > 0 ? refreshRate : 60.0;
-    spec.name = name.length ? [name copy] : @"USB Tablet Display";
+    spec.name = name.length ? [name copy] : @"Android Tablet Display";
     // Fixed synthetic EDID identifiers. Deliberately constant and unrelated to
     // any real hardware serial.
     spec.vendorID = 0x1234;

@@ -297,7 +297,7 @@ Then:
 2. Plug it into the Mac and accept the **Allow USB debugging** prompt. Any USB
    mode works — File transfer, Charging only, whatever — as long as debugging
    is on and the cable carries data. A charge-only cable will not do.
-3. `open "build/USB Tablet Display.app"`. It appears in the menu bar.
+3. `open "build/Android Tablet Display.app"`. It appears in the menu bar.
 4. Grant **Screen Recording** and **Accessibility** from its menu. Accessibility
    is what lets touch and pen move the Mac's pointer.
 5. Pick **Start**. The client launches on the tablet by itself.

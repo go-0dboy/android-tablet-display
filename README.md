@@ -1,4 +1,4 @@
-# USB Tablet Display
+# Android Tablet Display
 
 Turn an Android tablet into a real external display for macOS, over USB, with
 touch and pen input flowing back to the Mac.
@@ -8,7 +8,7 @@ it appears in the Displays pane. It is not a mirrored window.
 
 **Read [docs/STATUS.md](docs/STATUS.md) before relying on any of this.** It sets
 out exactly what has been run and what has only been written — including the
-fact that this depends on a private Apple API, and what happens when that
+fact that this depends on an unpublished Apple API, and what happens when that
 changes.
 
 ## Features
@@ -107,7 +107,7 @@ Full step-by-step install, and what to do when it does not work, is in
 ## Project Structure
 
 ```
-usb-tablet-display/
+android-tablet-display/
 ├── macos-host/
 │   ├── USBDisplayApp/       # Menu bar app (recommended)
 │   │   ├── Package.swift
@@ -139,21 +139,42 @@ usb-tablet-display/
 Both halves implement the protocol independently, and both test suites pin the
 byte layout, so the two cannot drift apart quietly.
 
+## How the display is created, and what that means for you
+
+macOS has no published way for an app to add a display that isn't a physical
+monitor. What it does have is the machinery Apple built for Sidecar and
+AirPlay: a class called `CGVirtualDisplay` that lives inside
+CoreGraphics.framework on every Mac. Apple never put it in the SDK headers or
+the documentation, so we declare the interface ourselves and call it. That is
+all "private API" means here. It is code that ships in macOS, running on your
+machine with your permissions, exactly like a public call; the only difference
+is that Apple hasn't promised to keep it.
+
+What follows from that, in practice:
+
+- **Nothing is missing from the app.** The display is a real display: apps see
+  it, windows move onto it, it appears in the Displays pane.
+- **A macOS update could break it without warning.** `swift run vdprobe`
+  checks your own machine in ten seconds. It has been seen working from
+  Mojave through macOS 26 Tahoe, and verified here on 26.6.2. History in
+  [docs/STATUS.md](docs/STATUS.md).
+- **It can't be sold on the Mac App Store.** App Review rejects private API.
+  Direct download and Developer ID notarisation are fine.
+
+BetterDisplay, Crisp and Deskreen's virtual mode all rest on the same call.
+
 ## Known limitations
 
-- **The virtual display uses a private, undocumented CoreGraphics API.**
-  Verified working on macOS 26.6.2; `swift run vdprobe` checks your own machine
-  in ten seconds. There is no public API that does this.
-- **Pinch to zoom uses ⌘+ / ⌘− by default, so it is stepped rather than
-  smooth, and only works in applications that have those shortcuts.** The
-  smooth trackpad-gesture path is implemented but macOS 26.6.2 does not deliver
-  synthesised magnify events at all — measured, with the per-application table
-  in [docs/STATUS.md](docs/STATUS.md). Two-finger scroll is unaffected and is
-  a real trackpad scroll.
+- **Pinch to zoom is stepped, not smooth, and only in apps that have ⌘+ / ⌘−.**
+  The smooth trackpad-gesture path is implemented, but macOS 26.6.2 does not
+  deliver synthesised magnify events at all — measured, with the
+  per-application table in [docs/STATUS.md](docs/STATUS.md). Two-finger scroll
+  is unaffected and is a real trackpad scroll.
 - **Wireless mode does not encrypt the video.** Pairing authenticates the
   device; it does not hide the pixels. See [docs/WIRELESS.md](docs/WIRELESS.md).
-- **Much of this is untested on real hardware.**
-  [docs/STATUS.md](docs/STATUS.md) lists exactly which parts.
+
+What has and hasn't been run on real hardware is a separate question from
+what the app can do; [docs/STATUS.md](docs/STATUS.md) keeps that list.
 
 ## Project structure
 

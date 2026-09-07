@@ -61,7 +61,7 @@ if command == "list" {
 
 guard AXIsProcessTrusted() else {
     fail("Accessibility permission is required. Grant it to the terminal or to "
-       + "USB Tablet Display.app, then run this again.")
+       + "Android Tablet Display.app, then run this again.")
 }
 
 let source = CGEventSource(stateID: .combinedSessionState)

@@ -207,8 +207,8 @@ final class DisplayGeometryTests: XCTestCase {
     /// serial number.
     func testDisplayNameIsFriendlyAndBounded() {
         XCTAssertEqual(DisplayGeometry.displayName(for: "SM_S931B"), "SM S931B")
-        XCTAssertEqual(DisplayGeometry.displayName(for: "   "), "USB Tablet Display")
-        XCTAssertEqual(DisplayGeometry.displayName(for: ""), "USB Tablet Display")
+        XCTAssertEqual(DisplayGeometry.displayName(for: "   "), "Android Tablet Display")
+        XCTAssertEqual(DisplayGeometry.displayName(for: ""), "Android Tablet Display")
         XCTAssertLessThanOrEqual(
             DisplayGeometry.displayName(for: String(repeating: "x", count: 200)).count, 40)
     }

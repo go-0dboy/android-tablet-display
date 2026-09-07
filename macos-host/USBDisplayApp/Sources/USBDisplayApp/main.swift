@@ -70,7 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "display",
-                                           accessibilityDescription: "USB Tablet Display")
+                                           accessibilityDescription: "Android Tablet Display")
         statusItem.button?.image?.isTemplate = true
 
         Logger.shared.onLog = { [weak self] line in self?.appendLog(line) }
@@ -90,7 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         bonjour.onError = { message in log(message) }
 
-        log("USB Tablet Display started")
+        log("Android Tablet Display started")
         logStartupDiagnostics()
 
         if wirelessRequested { transport = .wireless }
@@ -592,7 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 440),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        window.title = "USB Tablet Display — log"
+        window.title = "Android Tablet Display — log"
         window.center()
 
         let scrollView = NSScrollView(frame: window.contentView!.bounds)

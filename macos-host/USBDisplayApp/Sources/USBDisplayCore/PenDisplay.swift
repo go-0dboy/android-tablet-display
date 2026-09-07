@@ -113,7 +113,7 @@ public enum PenDisplayIdentifier {
                                 movinkOnUSB: Bool = false) -> PenDisplayKind {
         let name = identity.name.lowercased()
 
-        if name.contains("usb tablet display") { return .virtualDisplay }
+        if name.contains("android tablet display") || name.contains("usb tablet display") { return .virtualDisplay }
 
         let isWacomVendor = identity.vendorNumber == PenDisplayVendor.wacomEDID
         let isWacomName = name.contains("wacom") || name.contains("movink")
@@ -144,7 +144,7 @@ public enum PenDisplayIdentifier {
         switch classify(identity) {
         case .wacomMovink: return "Wacom Movink"
         case .wacom:       return "Wacom pen display"
-        case .virtualDisplay: return "USB Tablet Display"
+        case .virtualDisplay: return "Android Tablet Display"
         case .other:
             return "\(PenDisplayVendor.edidLetters(identity.vendorNumber)) display"
         }

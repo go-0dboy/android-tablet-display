@@ -135,7 +135,7 @@ public enum DisplayGeometry {
     public static func displayName(for deviceName: String) -> String {
         let trimmed = deviceName.trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "_", with: " ")
-        if trimmed.isEmpty { return "USB Tablet Display" }
+        if trimmed.isEmpty { return "Android Tablet Display" }
         if trimmed.count > 40 { return String(trimmed.prefix(40)) }
         return trimmed
     }
@@ -145,6 +145,6 @@ public enum DisplayGeometry {
         VirtualDisplaySpec(pixelWidth: 2560, pixelHeight: 1600,
                            pointWidth: 2560, pointHeight: 1600,
                            ppi: 110, hiDPI: false, refreshRate: 60,
-                           name: "USB Tablet Display")
+                           name: "Android Tablet Display")
     }
 }

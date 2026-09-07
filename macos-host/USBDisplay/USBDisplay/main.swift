@@ -795,7 +795,7 @@ class StreamingController {
             height: Int32(Config.targetHeight),
             ppi: 110,
             hiDPI: false,
-            name: "USB Tablet Display"
+            name: "Android Tablet Display"
         )
 
         if created {
