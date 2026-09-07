@@ -138,9 +138,6 @@ class TouchTranslator(
     private fun buttonsFor(sample: PointerSample): Int =
         if (sample.tool == ToolType.ERASER) 0x02 else 0x00
 
-    /** Barrel button state comes from MotionEvent.buttonState, set separately. */
-    var stylusBarrelPressed = false
-
     private fun handleSingleFinger(finger: PointerSample, phase: Phase): List<OutgoingMessage> {
         val messages = mutableListOf<OutgoingMessage>()
 

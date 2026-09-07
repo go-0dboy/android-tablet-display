@@ -53,6 +53,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var autoConnect = UserDefaults.standard.object(forKey: "autoConnect") as? Bool ?? true
     private var transport: TransportMode = .usb
     private var lastDeviceReady = false
+    /// Set when an automatic connection attempt fails, so the two-second
+    /// device poll does not retry the same failure forever. Cleared when the
+    /// device goes away, or when the person presses Start themselves.
+    private var autoConnectFailed = false
 
     /// `--start` begins streaming as soon as a device is ready, without
     /// touching the menu. Used by tools/e2e-test.sh and handy for a kiosk-ish
@@ -126,16 +130,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func pollDevices() {
         let changed = adb.refreshDevices()
+
+        // Auto-connect only ever fires for a real device on the cable. An
+        // emulator must never trigger it: streaming the Mac's screen somewhere
+        // the person did not ask for it, with no click, is not a convenience.
+        let cableDevice = adb.selected?.transport == .usb
         let ready = adb.selected != nil
 
-        // Seamlessness: once a device is trusted, plugging the cable in should
-        // be the entire interaction. No taps, no menu.
         if (autoConnect || autoStartRequested) && transport == .usb
-            && ready && !lastDeviceReady && !session.isRunning {
-            log("Device appeared; connecting automatically")
+            && cableDevice && !lastDeviceReady && !session.isRunning
+            && !autoConnectFailed {
+            log("Tablet plugged in; connecting automatically")
             startStreaming()
         }
-        lastDeviceReady = ready
+
+        // A device coming back resets the latch, so a transient failure does
+        // not disable auto-connect until the app is restarted.
+        if !ready { autoConnectFailed = false }
+
+        lastDeviceReady = cableDevice
         if changed { rebuildMenu() }
     }
 
@@ -159,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard Permissions.hasScreenRecording else {
             log("Cannot start: Screen Recording permission is not granted")
+            autoConnectFailed = true
             Permissions.requestScreenRecording()
             return
         }
@@ -168,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .usb:
                 guard adb.selected != nil else {
                     log("Cannot start: no Android device is ready")
+                    autoConnectFailed = true
                     return
                 }
                 try session.start(videoPort: WireProtocol.defaultVideoPort,
@@ -195,6 +210,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } catch {
             log("Could not start: \(error.localizedDescription)")
+            autoConnectFailed = true
             Task { await session.stop() }
         }
         rebuildMenu()
@@ -395,7 +411,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Menu actions
 
-    @objc private func startAction() { startStreaming() }
+    @objc private func startAction() {
+        autoConnectFailed = false
+        startStreaming()
+    }
     @objc private func stopAction() { stopStreaming() }
 
     @objc private func grantScreenRecording() {

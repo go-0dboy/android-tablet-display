@@ -313,6 +313,7 @@ final class InputServer {
     private func readLoop(_ fd: Int32) {
         var parser = InputStreamParser()
         var chunk = [UInt8](repeating: 0, count: 8192)
+        var inputOnlyFailure = false
 
         while running {
             let n = chunk.withUnsafeMutableBytes { ptr -> Int in
@@ -328,10 +329,13 @@ final class InputServer {
                     onMessage?(message)
                 }
             } catch {
-                // A malformed length means the stream is unrecoverable. Drop
-                // the connection and let the client reconnect cleanly rather
-                // than limping along on corrupt input.
-                log("Input stream error (\(error)); dropping the connection")
+                // A malformed length means this channel is unrecoverable, but
+                // the video stream and the display are fine. Drop only the
+                // input connection and let the client redial it — tearing the
+                // display down over one bad input byte is a far worse outcome
+                // than briefly losing touch.
+                log("Input stream error (\(error)); dropping the input channel only")
+                inputOnlyFailure = true
                 break
             }
         }
@@ -340,8 +344,12 @@ final class InputServer {
         if clientFD == fd { clientFD = -1 }
         lock.unlock()
         close(fd)
-        log("Input client disconnected")
-        onClientDisconnected?()
+        if inputOnlyFailure {
+            log("Input channel closed; the display and video stream are unaffected")
+        } else {
+            log("Input client disconnected")
+            onClientDisconnected?()
+        }
     }
 
     /// Send a message back to the client (hello-ack, keep-alive).

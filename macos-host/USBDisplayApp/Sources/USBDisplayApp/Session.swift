@@ -32,9 +32,6 @@ struct SessionStats {
     var droppedFrames = 0
     var clientName: String = ""
     var displaySize: String = ""
-    /// Round trip measured from a keep-alive, in milliseconds. Zero until the
-    /// client answers one.
-    var roundTripMilliseconds: Double = 0
     /// Capture-to-encoded time on the host, in milliseconds. This is the
     /// portion of the pipeline the host can measure directly; it excludes the
     /// wire and everything on the tablet.
