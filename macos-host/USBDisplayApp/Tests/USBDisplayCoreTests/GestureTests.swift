@@ -33,11 +33,16 @@ final class ZoomStepAccumulatorTests: XCTestCase {
 
     /// The remainder must carry over, or a slow pinch loses ground on every
     /// event and never zooms at all.
+    ///
+    /// Deliberately avoids landing exactly on the threshold: 0.01 + 0.09 is
+    /// 0.09999999999999999 in binary floating point, so an exact-boundary
+    /// assertion here would be testing the FPU rather than the carry-over.
     func testRemainderCarriesOver() {
         var accumulator = ZoomStepAccumulator(threshold: 0.1)
-        XCTAssertEqual(accumulator.steps(for: 0.09), 0)
-        XCTAssertEqual(accumulator.steps(for: 0.02), 1)   // 0.11 total
-        XCTAssertEqual(accumulator.steps(for: 0.09), 1)   // 0.10 remaining + 0.09
+        XCTAssertEqual(accumulator.steps(for: 0.09), 0)   // 0.09 held
+        XCTAssertEqual(accumulator.steps(for: 0.02), 1)   // 0.11 -> one step, 0.01 held
+        XCTAssertEqual(accumulator.steps(for: 0.05), 0)   // 0.06 held, still short
+        XCTAssertEqual(accumulator.steps(for: 0.05), 1)   // 0.11 -> one step
     }
 
     func testDirectionChangeCancelsRatherThanAccumulating() {
