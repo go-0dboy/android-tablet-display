@@ -7,10 +7,14 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "USBDisplayApp", targets: ["USBDisplayApp"])
+        .executable(name: "USBDisplayApp", targets: ["USBDisplayApp"]),
+        // Standalone diagnostic: does the private virtual-display API work on
+        // this machine? Run it before filing a bug.
+        .executable(name: "vdprobe", targets: ["VirtualDisplayProbe"]),
+        .library(name: "USBDisplayCore", targets: ["USBDisplayCore"])
     ],
     targets: [
-        // Objective-C module for CGVirtualDisplay private API
+        // Objective-C bridge to the private CGVirtualDisplay API.
         .target(
             name: "VirtualDisplay",
             path: "Sources/VirtualDisplay",
@@ -19,15 +23,19 @@ let package = Package(
                 .headerSearchPath(".")
             ]
         ),
+        // Pure logic: wire protocol, device selection, display geometry,
+        // gesture recognition, display presets. No AppKit, no sockets, so it
+        // is testable on any machine including CI.
+        .target(
+            name: "USBDisplayCore",
+            path: "Sources/USBDisplayCore"
+        ),
         .executableTarget(
             name: "USBDisplayApp",
-            dependencies: ["VirtualDisplay"],
+            dependencies: ["VirtualDisplay", "USBDisplayCore"],
             path: "Sources/USBDisplayApp",
             resources: [
                 .copy("Resources")
-            ],
-            swiftSettings: [
-                .unsafeFlags(["-parse-as-library"])
             ],
             linkerSettings: [
                 .linkedFramework("ScreenCaptureKit"),
@@ -37,6 +45,20 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("AppKit")
             ]
+        ),
+        .executableTarget(
+            name: "VirtualDisplayProbe",
+            dependencies: ["VirtualDisplay", "USBDisplayCore"],
+            path: "Sources/VirtualDisplayProbe",
+            linkerSettings: [
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("AppKit")
+            ]
+        ),
+        .testTarget(
+            name: "USBDisplayCoreTests",
+            dependencies: ["USBDisplayCore"],
+            path: "Tests/USBDisplayCoreTests"
         )
     ]
 )

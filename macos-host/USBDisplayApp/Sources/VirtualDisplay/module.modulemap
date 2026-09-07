@@ -1,4 +1,8 @@
 module VirtualDisplay {
-    umbrella header "VirtualDisplayManager.h"
+    header "VirtualDisplayManager.h"
+    header "CGVirtualDisplay.h"
+    header "CGVirtualDisplayDescriptor.h"
+    header "CGVirtualDisplaySettings.h"
+    header "CGVirtualDisplayMode.h"
     export *
 }
