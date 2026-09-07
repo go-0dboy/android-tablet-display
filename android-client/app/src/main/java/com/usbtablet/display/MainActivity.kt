@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity() {
         private const val SERVICE_TYPE = "_usbtablet._tcp."
 
         const val ACTION_SET_TOUCH_MODE = "com.usbtablet.display.SET_TOUCH_MODE"
+        const val ACTION_LOG_PEN = "com.usbtablet.display.LOG_PEN"
         const val ACTION_SHOW_FPS = "com.usbtablet.display.SHOW_FPS"
         const val ACTION_HIDE_FPS = "com.usbtablet.display.HIDE_FPS"
     }
@@ -76,6 +77,12 @@ class MainActivity : AppCompatActivity() {
                     translator.touchMode = TouchMode.from(intent.getStringExtra("mode"))
                     Log.d(TAG, "Touch mode: ${translator.touchMode}")
                 }
+                ACTION_LOG_PEN -> {
+                    PenDiagnostics.enabled = intent.getBooleanExtra("enabled", true)
+                    PenDiagnostics.reset()
+                    Log.i(TAG, "Pen diagnostics: ${PenDiagnostics.enabled}")
+                    if (PenDiagnostics.enabled) PenDiagnostics.logDeviceCapabilities()
+                }
             }
         }
     }
@@ -102,6 +109,7 @@ class MainActivity : AppCompatActivity() {
             addAction(ACTION_SHOW_FPS)
             addAction(ACTION_HIDE_FPS)
             addAction(ACTION_SET_TOUCH_MODE)
+            addAction(ACTION_LOG_PEN)
         }
         // The host sends these through `adb shell am broadcast`, which runs as
         // a different uid, so the receiver has to be exported. It is targeted
@@ -149,6 +157,7 @@ class MainActivity : AppCompatActivity() {
      * those branches never matched and multi-touch never worked.
      */
     private fun handleMotion(view: View, event: MotionEvent) {
+        PenDiagnostics.log(event)
         val out = inputOut ?: return
         if (view.width <= 0 || view.height <= 0) return
 
