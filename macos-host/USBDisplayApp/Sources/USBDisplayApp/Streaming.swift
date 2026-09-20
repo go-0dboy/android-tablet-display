@@ -269,8 +269,26 @@ final class VideoEncoder {
 
 // MARK: - Capture
 
+/// Common interface for display-capture implementations.
+///
+/// macOS 13+ uses ScreenCaptureKit. Monterey uses the older
+/// CGDisplayStream API because it is known to work with the virtual
+/// displays created by this application on macOS 12.
+protocol DisplayCapturer: AnyObject {
+    var onEncodedFrame: ((Data, Bool) -> Void)? { get set }
+    var onStreamError: ((Error) -> Void)? { get set }
+
+    func start(displayID: CGDirectDisplayID,
+               settings: EncoderSettings) async throws
+    func stop() async
+    func forceKeyframe()
+    func drainEncodeLatency()
+        -> (median: Double, worst: Double, count: Int)?
+}
+
 /// Captures one display with ScreenCaptureKit and feeds the encoder.
-final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput {
+@available(macOS 12.3, *)
+final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput, DisplayCapturer {
     private var stream: SCStream?
     private var encoder: VideoEncoder?
 

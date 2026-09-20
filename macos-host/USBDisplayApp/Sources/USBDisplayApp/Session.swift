@@ -45,7 +45,7 @@ final class StreamingSession: ObservableObject {
     private let virtualDisplay = VirtualDisplayManager()
     private var videoServer: VideoServer?
     private var inputServer: InputServer?
-    private var capturer: ScreenCapturer?
+    private var capturer: DisplayCapturer?
     private var injector: InputInjector?
 
     private(set) var displayID: CGDirectDisplayID = 0
@@ -277,7 +277,16 @@ final class StreamingSession: ObservableObject {
     private func startCapture(spec: VirtualDisplaySpec) async {
         await capturer?.stop()
 
-        let capturer = ScreenCapturer()
+        let capturer: DisplayCapturer
+
+        if #available(macOS 13.0, *) {
+            log("Capture backend: ScreenCaptureKit")
+            capturer = ScreenCapturer()
+        } else {
+            log("Capture backend: CGDisplayStream (Monterey)")
+            capturer = CGDisplayStreamCapturer()
+        }
+
         capturer.onEncodedFrame = { [weak self] data, _ in
             guard let self else { return }
             if self.videoServer?.send(frame: data) == true {
