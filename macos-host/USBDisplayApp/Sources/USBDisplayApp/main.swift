@@ -675,4 +675,21 @@ private func runApplication() {
     app.run()
 }
 
-runApplication()
+if CommandLine.arguments.contains("--capture-probe") {
+    // The probe does not enter NSApplication.run().  Its asynchronous
+    // capture work runs while the ordinary main RunLoop services the
+    // MainActor.  exit() terminates the process when the probe completes.
+    Task { @MainActor in
+        let result = await CaptureProbe.run()
+        exit(Int32(result))
+    }
+
+    while true {
+        _ = RunLoop.main.run(
+            mode: .default,
+            before: Date(timeIntervalSinceNow: 0.25)
+        )
+    }
+} else {
+    runApplication()
+}
