@@ -146,9 +146,44 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
         )
     }
 
+    // CGDisplayStream may deliver frames faster than the stream profile asks for.
+    // VideoToolbox's ExpectedFrameRate is only a hint; it does not throttle input.
+    //
+    // Drop excess capture callbacks BEFORE VideoToolbox sees them. This is safe
+    // for H.264 prediction because the encoder builds its dependency chain only
+    // from frames that are actually submitted to it.
+    private let pacingLock = NSLock()
+    private var lastSubmittedFrameSeconds: Double = 0
+
+    private func shouldSubmitFrame(frameRate: Int) -> Bool {
+        let fps = max(frameRate, 1)
+        let minimumInterval = 1.0 / Double(fps)
+
+        let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
+        let now = CMTimeGetSeconds(hostTime)
+
+        pacingLock.lock()
+        defer { pacingLock.unlock() }
+
+        if lastSubmittedFrameSeconds > 0,
+           now - lastSubmittedFrameSeconds < minimumInterval {
+            return false
+        }
+
+        // Use the actual submission time rather than trying to "catch up".
+        // Catch-up bursts are exactly what we do not want for an interactive
+        // display and an old hardware decoder.
+        lastSubmittedFrameSeconds = now
+        return true
+    }
+
     private func handle(surface: IOSurfaceRef,
                         displayTime: UInt64,
                         settings: EncoderSettings) {
+
+        guard shouldSubmitFrame(frameRate: settings.frameRate) else {
+            return
+        }
 
         var unmanagedPixelBuffer: Unmanaged<CVPixelBuffer>?
 

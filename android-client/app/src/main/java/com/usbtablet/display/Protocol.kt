@@ -54,6 +54,10 @@ object ClientFlags {
     const val HAS_TILT = 1 shl 2
     const val DEX_ACTIVE = 1 shl 3
     const val PEN_ONLY = 1 shl 4
+
+    // Old Android video stacks can expose hardware H.264 decoders that
+    // become unstable with the modern 60 fps / high-bitrate stream.
+    const val LEGACY_VIDEO_DECODER = 1 shl 5
 }
 
 sealed class OutgoingMessage {

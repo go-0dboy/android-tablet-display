@@ -129,6 +129,14 @@ object DeviceInfo {
         if (hasTilt()) flags = flags or ClientFlags.HAS_TILT
         if (isDeXActive(context)) flags = flags or ClientFlags.DEX_ACTIVE
         if (penOnly) flags = flags or ClientFlags.PEN_ONLY
+
+        // Android 7.1 and older commonly use first-generation hardware
+        // MediaCodec implementations. Ask the host for the conservative
+        // H.264 compatibility stream instead of the modern default.
+        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.N_MR1) {
+            flags = flags or ClientFlags.LEGACY_VIDEO_DECODER
+        }
+
         return flags
     }
 }

@@ -516,18 +516,57 @@ class MainActivity : AppCompatActivity() {
 
     private fun decodeFrame(data: ByteArray) {
         val codec = decoder ?: return
+
         try {
-            val inputIndex = codec.dequeueInputBuffer(10_000)
-            if (inputIndex >= 0) {
-                codec.getInputBuffer(inputIndex)?.apply { clear(); put(data) }
-                codec.queueInputBuffer(inputIndex, 0, data.size, 0, 0)
-            }
             val info = MediaCodec.BufferInfo()
-            var outputIndex = codec.dequeueOutputBuffer(info, 0)
-            while (outputIndex >= 0) {
-                codec.releaseOutputBuffer(outputIndex, true)
-                outputIndex = codec.dequeueOutputBuffer(info, 0)
+
+            fun drainOutput() {
+                var outputIndex = codec.dequeueOutputBuffer(info, 0)
+                while (outputIndex >= 0) {
+                    codec.releaseOutputBuffer(outputIndex, true)
+                    outputIndex = codec.dequeueOutputBuffer(info, 0)
+                }
             }
+
+            // Do not silently discard a compressed H.264 access unit.
+            // A later P-frame may depend on it and the picture will remain
+            // corrupted until the next IDR frame.
+            drainOutput()
+
+            var inputIndex = codec.dequeueInputBuffer(10_000)
+
+            while (inputIndex < 0 && running.get()) {
+                // Free decoded output before waiting for another input slot.
+                drainOutput()
+                inputIndex = codec.dequeueInputBuffer(10_000)
+            }
+
+            if (inputIndex < 0) {
+                return
+            }
+
+            val inputBuffer = codec.getInputBuffer(inputIndex)
+                ?: throw IllegalStateException("MediaCodec returned no input buffer")
+
+            if (data.size > inputBuffer.capacity()) {
+                throw IllegalStateException(
+                    "Encoded frame ${data.size} exceeds decoder input buffer ${inputBuffer.capacity()}"
+                )
+            }
+
+            inputBuffer.clear()
+            inputBuffer.put(data)
+
+            codec.queueInputBuffer(
+                inputIndex,
+                0,
+                data.size,
+                0,
+                0
+            )
+
+            drainOutput()
+
         } catch (e: IllegalStateException) {
             Log.e(TAG, "Decoder fell over; restarting it", e)
             releaseDecoder()

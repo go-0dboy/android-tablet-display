@@ -62,12 +62,18 @@ enum VideoCodec: String, CaseIterable {
     }
 }
 
+enum H264Profile {
+    case baseline
+    case main
+}
+
 struct EncoderSettings {
     var width: Int32
     var height: Int32
     var frameRate: Int
     var bitRate: Int32
     var codec: VideoCodec
+    var h264Profile: H264Profile = .main
 }
 
 /// Hardware video encoder. Emits Annex-B access units with parameter sets
@@ -86,11 +92,20 @@ final class VideoEncoder {
         self.settings = settings
 
         var created: VTCompressionSession?
+
+        // Explicitly allow VideoToolbox to select the hardware encoder.
+        // This still permits a software fallback if this Mac cannot provide
+        // hardware encoding for the requested codec/profile.
+        let encoderSpecification = [
+            kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder:
+                kCFBooleanTrue!
+        ] as CFDictionary
+
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: settings.width, height: settings.height,
             codecType: settings.codec.cmType,
-            encoderSpecification: nil, imageBufferAttributes: nil,
+            encoderSpecification: encoderSpecification, imageBufferAttributes: nil,
             compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
             compressionSessionOut: &created)
 
@@ -99,14 +114,42 @@ final class VideoEncoder {
         }
         self.session = session
         configure(session)
+
+        var hardwareValue: CFTypeRef?
+        let hardwareStatus = withUnsafeMutablePointer(to: &hardwareValue) { pointer in
+            VTSessionCopyProperty(
+                session,
+                key: kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                allocator: kCFAllocatorDefault,
+                valueOut: pointer
+            )
+        }
+
+        if hardwareStatus == noErr, let hardwareValue {
+            let usingHardware = CFBooleanGetValue(
+                unsafeBitCast(hardwareValue, to: CFBoolean.self)
+            )
+            log("VideoToolbox hardware encoder: \(usingHardware ? "yes" : "no")")
+        } else {
+            log("VideoToolbox hardware encoder: unknown (status \(hardwareStatus))")
+        }
+
         log("Encoder ready: \(settings.codec.rawValue) \(settings.width)x\(settings.height) "
             + "@ \(settings.frameRate)fps, \(settings.bitRate / 1_000_000) Mbps")
     }
 
     private func configure(_ session: VTCompressionSession) {
-        let profile: CFString = settings.codec == .h264
-            ? kVTProfileLevel_H264_Main_AutoLevel
-            : kVTProfileLevel_HEVC_Main_AutoLevel
+        let profile: CFString
+        if settings.codec == .h264 {
+            switch settings.h264Profile {
+            case .baseline:
+                profile = kVTProfileLevel_H264_Baseline_AutoLevel
+            case .main:
+                profile = kVTProfileLevel_H264_Main_AutoLevel
+            }
+        } else {
+            profile = kVTProfileLevel_HEVC_Main_AutoLevel
+        }
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,

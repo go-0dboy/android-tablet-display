@@ -179,6 +179,10 @@ public struct ClientFlags: OptionSet, Equatable, Sendable {
     public static let dexActive = ClientFlags(rawValue: 1 << 3)
     /// User asked for pen-only mode: fingers do not move the pointer.
     public static let penOnly = ClientFlags(rawValue: 1 << 4)
+
+    /// Client asks for a conservative H.264 stream suitable for old
+    /// hardware MediaCodec implementations.
+    public static let legacyVideoDecoder = ClientFlags(rawValue: 1 << 5)
 }
 
 /// Host's answer to a hello: what it actually created.

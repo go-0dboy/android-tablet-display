@@ -90,6 +90,10 @@ final class StreamingSession: ObservableObject {
     /// client to reconnect and say hello again.
     private var lastHello: ClientHello?
 
+    // Changes whenever a virtual display is replaced or destroyed.
+    // Async capture/cleanup work must belong to the generation that created it.
+    private var displayGeneration: UInt64 = 0
+
     // MARK: - Lifecycle
 
     func start(videoPort: UInt16, inputPort: UInt16, loopbackOnly: Bool) throws {
@@ -103,13 +107,13 @@ final class StreamingSession: ObservableObject {
             Task { @MainActor in self?.capturer?.forceKeyframe() }
         }
         video.onClientDisconnected = { [weak self] in
-            Task { @MainActor in self?.handleClientGone() }
+            Task { @MainActor in await self?.handleClientGone() }
         }
         input.onMessage = { [weak self] message in
             Task { @MainActor in self?.handle(message) }
         }
         input.onClientDisconnected = { [weak self] in
-            Task { @MainActor in self?.handleClientGone() }
+            Task { @MainActor in await self?.handleClientGone() }
         }
 
         try video.start()
@@ -230,7 +234,15 @@ final class StreamingSession: ObservableObject {
         }
 
         lastHello = hello
-        let spec = DisplayGeometry.spec(for: hello, refreshRate: Double(frameRate),
+
+        let legacyVideo = hello.flags.contains(.legacyVideoDecoder)
+        let displayFrameRate = legacyVideo ? 30 : frameRate
+
+        if legacyVideo {
+            log("Legacy video client detected: using 30 Hz compatibility mode")
+        }
+
+        let spec = DisplayGeometry.spec(for: hello, refreshRate: Double(displayFrameRate),
                                         scale: scalePreference)
         guard createDisplay(spec: spec) else {
             inputServer?.send(.helloAck(HelloAck(
@@ -249,7 +261,15 @@ final class StreamingSession: ObservableObject {
             displayWidth: UInt32(spec.pixelWidth), displayHeight: UInt32(spec.pixelHeight),
             message: "\(spec.pixelWidth)x\(spec.pixelHeight)")))
 
-        Task { await startCapture(spec: spec) }
+        let generation = displayGeneration
+        let targetDisplayID = displayID
+        Task {
+            await startCapture(
+                spec: spec,
+                generation: generation,
+                targetDisplayID: targetDisplayID
+            )
+        }
         onStateChanged?()
     }
 
@@ -262,6 +282,7 @@ final class StreamingSession: ObservableObject {
             return false
         }
         displayID = virtualDisplay.displayID
+        displayGeneration &+= 1
 
         if let injector {
             injector.updateDisplayID(displayID)
@@ -274,8 +295,39 @@ final class StreamingSession: ObservableObject {
         return true
     }
 
-    private func startCapture(spec: VirtualDisplaySpec) async {
-        await capturer?.stop()
+    private func startCapture(
+        spec: VirtualDisplaySpec,
+        generation: UInt64,
+        targetDisplayID: CGDirectDisplayID
+    ) async {
+        guard generation == displayGeneration,
+              targetDisplayID != 0,
+              displayID == targetDisplayID else {
+            log("Skipping stale capture start")
+            return
+        }
+
+        let previousCapturer = capturer
+        capturer = nil
+        await previousCapturer?.stop()
+
+        guard generation == displayGeneration,
+              targetDisplayID != 0,
+              displayID == targetDisplayID else {
+            log("Skipping stale capture start after previous capture stopped")
+            return
+        }
+
+        let legacyVideo = lastHello?.flags.contains(.legacyVideoDecoder) == true
+
+        let streamFrameRate = legacyVideo ? 30 : frameRate
+        let streamBitRate: Int32 = legacyVideo ? 4_000_000 : bitRate
+        let streamCodec: VideoCodec = legacyVideo ? .h264 : codec
+        let streamProfile: H264Profile = legacyVideo ? .baseline : .main
+
+        if legacyVideo {
+            log("Legacy video mode: H.264 Baseline, 30 fps, 4 Mbps")
+        }
 
         let capturer: DisplayCapturer
 
@@ -300,12 +352,21 @@ final class StreamingSession: ObservableObject {
 
         do {
             try await capturer.start(
-                displayID: displayID,
+                displayID: targetDisplayID,
                 settings: EncoderSettings(width: Int32(spec.pixelWidth),
                                           height: Int32(spec.pixelHeight),
-                                          frameRate: frameRate,
-                                          bitRate: bitRate,
-                                          codec: codec))
+                                          frameRate: streamFrameRate,
+                                          bitRate: streamBitRate,
+                                          codec: streamCodec,
+                                          h264Profile: streamProfile))
+            guard generation == displayGeneration,
+                  targetDisplayID != 0,
+                  displayID == targetDisplayID else {
+                log("Discarding capture started for a stale virtual display")
+                await capturer.stop()
+                return
+            }
+
             self.capturer = capturer
             capturer.forceKeyframe()
         } catch {
@@ -315,7 +376,7 @@ final class StreamingSession: ObservableObject {
         }
     }
 
-    private func handleClientGone() {
+    private func handleClientGone() async {
         guard clientConnected else { return }
         clientConnected = false
         // Leave no phantom pen hovering over a display that is going away.
@@ -324,16 +385,27 @@ final class StreamingSession: ObservableObject {
         log("Client disconnected; waiting for it to come back")
         onStateChanged?()
 
-        Task {
-            await capturer?.stop()
-            capturer = nil
-            // The display is torn down too: leaving an orphan virtual display
-            // on the desktop after the tablet is unplugged is worse than
-            // rebuilding one when it returns.
-            virtualDisplay.destroyDisplay()
-            displayID = 0
-            onStateChanged?()
+        let disconnectedGeneration = displayGeneration
+        let disconnectedCapturer = capturer
+        capturer = nil
+
+        await disconnectedCapturer?.stop()
+
+        // A new hello may have created a replacement display while stop()
+        // was suspended. Never let stale cleanup destroy that new display.
+        guard displayGeneration == disconnectedGeneration else {
+            log("Ignoring stale disconnect cleanup; a newer display is active")
+            return
         }
+
+        displayGeneration &+= 1
+
+        // The display is torn down too: leaving an orphan virtual display
+        // on the desktop after the tablet is unplugged is worse than
+        // rebuilding one when it returns.
+        virtualDisplay.destroyDisplay()
+        displayID = 0
+        onStateChanged?()
     }
 
     /// Rebuild the display at a new scale, reusing what the client already
@@ -348,7 +420,13 @@ final class StreamingSession: ObservableObject {
         guard createDisplay(spec: spec) else { return }
         stats.displaySize = "\(spec.pixelWidth)x\(spec.pixelHeight)"
             + (spec.hiDPI ? " HiDPI" : "")
-        await startCapture(spec: spec)
+        let generation = displayGeneration
+        let targetDisplayID = displayID
+        await startCapture(
+            spec: spec,
+            generation: generation,
+            targetDisplayID: targetDisplayID
+        )
         onStateChanged?()
     }
 
