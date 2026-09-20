@@ -27,13 +27,30 @@ it appears in System Settings › Displays. It is not a mirrored window.
 
 ## Requirements
 
-**Mac:** macOS 13 or later, `adb` (`brew install --cask android-platform-tools`),
-Screen Recording permission, and Accessibility permission for input.
+**Mac:** macOS 12 or later, `adb` (`brew install --cask android-platform-tools`),
+Screen Recording permission, and Accessibility permission for input. The
+Monterey capture backend is tested on macOS 12.7.6 on an Intel Mac.
 
-**Tablet:** Android 8 or later, USB debugging enabled, and a USB cable that
-carries data.
+**Tablet:** Android 7.1 or later, USB debugging enabled, and a USB cable that
+carries data. Android 7 uses an automatic compatibility profile: H.264
+Baseline, 1280x800 at 30 fps and a 5 Mbps target on the tested Galaxy Tab 2.
 
 ## Install
+
+Ready-built applications are attached to the
+[latest GitHub release](https://github.com/not-inept/android-tablet-display/releases/latest):
+
+- `Android-Tablet-Display-macOS-v2.0.0.zip` — the macOS menu-bar app;
+- `Android-Tablet-Display-Android-v2.0.0.apk` — the Android client.
+
+The macOS build is ad-hoc signed rather than notarised. If Gatekeeper retains
+the download quarantine, unpack it and run:
+
+```bash
+xattr -dr com.apple.quarantine "Android Tablet Display.app"
+```
+
+To build from source instead:
 
 ```bash
 # Mac app. Build it as a .app bundle: macOS ties Screen Recording permission
@@ -85,7 +102,8 @@ macOS (Swift)                          Android (Kotlin)
 ```
 
 - **Video**: H.264 Main profile (HEVC optional), 15 Mbps, 60 fps target. A
-  keyframe is forced whenever a client connects.
+  keyframe is forced whenever a client connects. Legacy Android decoders use
+  a separate H.264 Baseline, 30 fps compatibility profile.
 - **Resolution**: from the tablet's hello message, aligned to 16 pixels for
   the encoder, capped at 4096.
 - **Transport**: `adb reverse` over USB, plain TCP over Wi-Fi. Ports 5560

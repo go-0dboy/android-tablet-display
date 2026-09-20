@@ -18,7 +18,7 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
         qos: .userInteractive
     )
 
-    var onEncodedFrame: ((Data, Bool) -> Void)?
+    var onEncodedFrame: ((Data, Bool, @escaping () -> Void) -> Void)?
     var onStreamError: ((Error) -> Void)?
 
     private(set) var lastFrameAt: Date?
@@ -27,6 +27,18 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
     private var encodeLatenciesMs: [Double] = []
     private var pendingCaptureAt: [Int64: CFAbsoluteTime] = [:]
     private let latencyLock = NSLock()
+
+    // Bound the complete encoder/network pipeline. Frames which have not yet
+    // entered VideoToolbox are safe to replace; encoded H.264 access units are
+    // always delivered in order by VideoServer.
+    private let maxFramesInFlight = 2
+    private var framesInFlight = 0
+    private var outstandingFrames = Set<Int64>()
+    private var pendingLatestFrame: (CVPixelBuffer, CFAbsoluteTime)?
+    private var currentFrame: CVPixelBuffer?
+    private var frameTimer: DispatchSourceTimer?
+    private let metricsLock = NSLock()
+    private var pipelineMetrics = CapturePipelineMetrics()
 
     private var stopping = false
 
@@ -48,6 +60,15 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
         )
     }
 
+    func drainPipelineMetrics() -> CapturePipelineMetrics {
+        metricsLock.lock()
+        var result = pipelineMetrics
+        pipelineMetrics = CapturePipelineMetrics()
+        metricsLock.unlock()
+        result.framesInFlight = captureQueue.sync { framesInFlight }
+        return result
+    }
+
     func forceKeyframe() {
         encoder?.forceKeyframe()
     }
@@ -59,8 +80,25 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
 
         let encoder = try VideoEncoder(settings: settings)
 
-        encoder.onEncodedFrame = { [weak self] data, isKeyframe in
-            self?.onEncodedFrame?(data, isKeyframe)
+        encoder.onEncodedFrame = { [weak self] data, isKeyframe, presentationValue in
+            guard let self = self else { return }
+            self.metricsLock.lock()
+            self.pipelineMetrics.encoded += 1
+            self.metricsLock.unlock()
+
+            let completion: () -> Void = { [weak self] in
+                guard let self = self else { return }
+                self.completeFrame(presentationValue)
+            }
+            if let deliver = self.onEncodedFrame {
+                deliver(data, isKeyframe, completion)
+            } else {
+                completion()
+            }
+        }
+
+        encoder.onFrameFinished = { [weak self] presentationValue, _, emitted in
+            if !emitted { self?.completeFrame(presentationValue) }
         }
 
         encoder.onFramePresentationTime = { [weak self] presentationValue in
@@ -86,6 +124,7 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
 
         self.encoder = encoder
         stopping = false
+        startFrameTimer(frameRate: settings.frameRate)
 
         let outputWidth = Int(settings.width)
         let outputHeight = Int(settings.height)
@@ -97,18 +136,14 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
             pixelFormat: Int32(kCVPixelFormatType_32BGRA),
             properties: nil,
             queue: captureQueue,
-            handler: { [weak self] status, displayTime, surface, _ in
+            handler: { [weak self] status, _, surface, _ in
                 guard let self = self else { return }
 
                 switch status {
 
                 case .frameComplete:
                     guard let surface = surface else { return }
-                    self.handle(
-                        surface: surface,
-                        displayTime: displayTime,
-                        settings: settings
-                    )
+                    self.handle(surface: surface)
 
                 case .stopped:
                     if !self.stopping {
@@ -125,6 +160,7 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
                 }
             }
         ) else {
+            stopFrameTimer()
             self.encoder?.invalidate()
             self.encoder = nil
             throw CaptureError.streamCreationFailed(displayID)
@@ -133,6 +169,7 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
         let result = stream.start()
 
         guard result == .success else {
+            stopFrameTimer()
             self.encoder?.invalidate()
             self.encoder = nil
             throw CaptureError.streamStartFailed(result)
@@ -146,44 +183,7 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
         )
     }
 
-    // CGDisplayStream may deliver frames faster than the stream profile asks for.
-    // VideoToolbox's ExpectedFrameRate is only a hint; it does not throttle input.
-    //
-    // Drop excess capture callbacks BEFORE VideoToolbox sees them. This is safe
-    // for H.264 prediction because the encoder builds its dependency chain only
-    // from frames that are actually submitted to it.
-    private let pacingLock = NSLock()
-    private var lastSubmittedFrameSeconds: Double = 0
-
-    private func shouldSubmitFrame(frameRate: Int) -> Bool {
-        let fps = max(frameRate, 1)
-        let minimumInterval = 1.0 / Double(fps)
-
-        let hostTime = CMClockGetTime(CMClockGetHostTimeClock())
-        let now = CMTimeGetSeconds(hostTime)
-
-        pacingLock.lock()
-        defer { pacingLock.unlock() }
-
-        if lastSubmittedFrameSeconds > 0,
-           now - lastSubmittedFrameSeconds < minimumInterval {
-            return false
-        }
-
-        // Use the actual submission time rather than trying to "catch up".
-        // Catch-up bursts are exactly what we do not want for an interactive
-        // display and an old hardware decoder.
-        lastSubmittedFrameSeconds = now
-        return true
-    }
-
-    private func handle(surface: IOSurfaceRef,
-                        displayTime: UInt64,
-                        settings: EncoderSettings) {
-
-        guard shouldSubmitFrame(frameRate: settings.frameRate) else {
-            return
-        }
+    private func handle(surface: IOSurfaceRef) {
 
         var unmanagedPixelBuffer: Unmanaged<CVPixelBuffer>?
 
@@ -207,29 +207,105 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
         lastFrameAt = Date()
         capturedFrames += 1
 
-        // Host clock gives VideoToolbox a monotonic timestamp.
-        let presentation =
-            CMClockGetTime(CMClockGetHostTimeClock())
+        metricsLock.lock()
+        pipelineMetrics.captureCallbacks += 1
+        metricsLock.unlock()
 
-        latencyLock.lock()
+        enqueueLatest(pixelBuffer: pixelBuffer)
+    }
 
-        pendingCaptureAt[presentation.value] =
-            CFAbsoluteTimeGetCurrent()
+    /// Called only on captureQueue. CGDisplayStream may issue callbacks at the
+    /// main display's 60 Hz even when the virtual display is 30 Hz. Keep only
+    /// the newest callback; a fixed-cadence timer performs admission without
+    /// the jitter sensitivity of an elapsed-time check inside this callback.
+    private func enqueueLatest(pixelBuffer: CVPixelBuffer) {
+        guard encoder != nil, !stopping else { return }
 
-        if pendingCaptureAt.count > 240 {
-            pendingCaptureAt.removeAll(keepingCapacity: true)
+        if pendingLatestFrame != nil {
+            metricsLock.lock()
+            pipelineMetrics.replacements += 1
+            metricsLock.unlock()
+        }
+        pendingLatestFrame = (pixelBuffer, CFAbsoluteTimeGetCurrent())
+    }
+
+    private func submitLatestIfPossible() {
+        guard !stopping, framesInFlight < maxFramesInFlight else { return }
+
+        let pixelBuffer: CVPixelBuffer
+        let capturedAt: CFAbsoluteTime
+
+        if let pending = pendingLatestFrame {
+            pendingLatestFrame = nil
+            currentFrame = pending.0
+            pixelBuffer = pending.0
+            capturedAt = pending.1
+        } else if let currentFrame = currentFrame {
+            // CGDisplayStream is damage-driven and may deliver only a handful
+            // of callbacks per second while typing. Keep feeding the last
+            // surface at the requested cadence so VideoToolbox does not hold a
+            // sparse update until another damaged frame arrives.
+            pixelBuffer = currentFrame
+            capturedAt = CFAbsoluteTimeGetCurrent()
+        } else {
+            return
         }
 
+        // A repeated image is still a distinct video frame. Give every
+        // submission a fresh monotonic timestamp rather than reusing the
+        // timestamp from the CGDisplayStream callback.
+        let presentation = CMClockGetTime(CMClockGetHostTimeClock())
+        submit(pixelBuffer: pixelBuffer,
+               timestamp: presentation,
+               capturedAt: capturedAt)
+    }
+
+    private func submit(pixelBuffer: CVPixelBuffer,
+                        timestamp: CMTime,
+                        capturedAt: CFAbsoluteTime) {
+        framesInFlight += 1
+        outstandingFrames.insert(timestamp.value)
+
+        metricsLock.lock()
+        pipelineMetrics.submitted += 1
+        metricsLock.unlock()
+
+        latencyLock.lock()
+        pendingCaptureAt[timestamp.value] = capturedAt
         latencyLock.unlock()
 
-        encoder?.encode(
-            pixelBuffer: pixelBuffer,
-            timestamp: presentation
-        )
+        encoder?.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
+    }
+
+    private func completeFrame(_ presentationValue: Int64) {
+        captureQueue.async { [weak self] in
+            guard let self = self,
+                  self.outstandingFrames.remove(presentationValue) != nil else { return }
+
+            self.framesInFlight -= 1
+        }
+    }
+
+    private func startFrameTimer(frameRate: Int) {
+        let framesPerSecond = max(frameRate, 1)
+        let interval = DispatchTimeInterval.nanoseconds(1_000_000_000 / framesPerSecond)
+        let timer = DispatchSource.makeTimerSource(queue: captureQueue)
+        timer.schedule(deadline: .now(), repeating: interval, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.submitLatestIfPossible()
+        }
+        frameTimer = timer
+        timer.resume()
+    }
+
+    private func stopFrameTimer() {
+        frameTimer?.cancel()
+        frameTimer = nil
     }
 
     func stop() async {
         stopping = true
+        stopFrameTimer()
 
         if let stream = stream {
             _ = stream.stop()
@@ -239,6 +315,13 @@ final class CGDisplayStreamCapturer: DisplayCapturer {
 
         encoder?.invalidate()
         encoder = nil
+
+        captureQueue.sync {
+            pendingLatestFrame = nil
+            currentFrame = nil
+            outstandingFrames.removeAll()
+            framesInFlight = 0
+        }
 
         clearPendingCaptureState()
     }

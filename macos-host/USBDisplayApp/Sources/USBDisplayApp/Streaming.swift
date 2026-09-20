@@ -74,6 +74,9 @@ struct EncoderSettings {
     var bitRate: Int32
     var codec: VideoCodec
     var h264Profile: H264Profile = .main
+    var maxFrameDelayCount: Int? = nil
+    var enforceDataRateLimit = false
+    var keyframeIntervalSeconds = 2
 }
 
 /// Hardware video encoder. Emits Annex-B access units with parameter sets
@@ -83,10 +86,14 @@ final class VideoEncoder {
     private let settings: EncoderSettings
     private var forceKeyframeNext = false
 
-    var onEncodedFrame: ((Data, Bool) -> Void)?
+    var onEncodedFrame: ((Data, Bool, Int64) -> Void)?
     /// Reports the presentation timestamp of each frame as it comes out, so
     /// the capturer can pair it with when that frame went in.
     var onFramePresentationTime: ((Int64) -> Void)?
+
+    // Reports whether an encode callback produced a usable access unit. This
+    // is encoder completion only; network delivery is tracked separately.
+    var onFrameFinished: ((Int64, OSStatus, Bool) -> Void)?
 
     init(settings: EncoderSettings) throws {
         self.settings = settings
@@ -139,6 +146,13 @@ final class VideoEncoder {
     }
 
     private func configure(_ session: VTCompressionSession) {
+        func set(_ key: CFString, _ value: CFTypeRef, named name: String) {
+            let status = VTSessionSetProperty(session, key: key, value: value)
+            if status != noErr {
+                log("Encoder rejected \(name) (status \(status))")
+            }
+        }
+
         let profile: CFString
         if settings.codec == .h264 {
             switch settings.h264Profile {
@@ -150,21 +164,43 @@ final class VideoEncoder {
         } else {
             profile = kVTProfileLevel_HEVC_Main_AutoLevel
         }
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: profile)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering,
-                             value: kCFBooleanFalse)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,
-                             value: settings.bitRate as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate,
-                             value: settings.frameRate as CFNumber)
-        // A keyframe every two seconds bounds how long a reconnecting client
-        // stares at a black screen — and forceKeyframe() covers the common case.
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,
-                             value: (settings.frameRate * 2) as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
-                             value: 2 as CFNumber)
-        VTCompressionSessionPrepareToEncodeFrames(session)
+        set(kVTCompressionPropertyKey_ProfileLevel, profile, named: "profile")
+        set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, named: "real-time mode")
+        set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse,
+            named: "frame reordering")
+
+        if let maxFrameDelayCount = settings.maxFrameDelayCount {
+            set(kVTCompressionPropertyKey_MaxFrameDelayCount,
+                maxFrameDelayCount as CFNumber,
+                named: "maximum frame delay")
+        }
+
+        set(kVTCompressionPropertyKey_ExpectedFrameRate,
+            settings.frameRate as CFNumber,
+            named: "expected frame rate")
+        set(kVTCompressionPropertyKey_AverageBitRate,
+            settings.bitRate as CFNumber,
+            named: "average bit rate")
+        if settings.enforceDataRateLimit {
+            let bytesPerSecond = max(Int(settings.bitRate) / 8, 1)
+            let limits = [
+                NSNumber(value: bytesPerSecond),
+                NSNumber(value: 1)
+            ] as CFArray
+            set(kVTCompressionPropertyKey_DataRateLimits, limits,
+                named: "data-rate limit")
+        }
+        let keyframeSeconds = max(settings.keyframeIntervalSeconds, 1)
+        set(kVTCompressionPropertyKey_MaxKeyFrameInterval,
+            (settings.frameRate * keyframeSeconds) as CFNumber,
+            named: "keyframe interval")
+        set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration,
+            keyframeSeconds as CFNumber,
+            named: "keyframe interval duration")
+        let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(session)
+        if prepareStatus != noErr {
+            log("Encoder preparation failed (status \(prepareStatus))")
+        }
     }
 
     /// Ask for an immediate keyframe. Called the moment a client connects, so
@@ -183,25 +219,39 @@ final class VideoEncoder {
             properties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue!] as CFDictionary
         }
 
-        VTCompressionSessionEncodeFrame(
+        let presentationValue = timestamp.value
+
+        let submitStatus = VTCompressionSessionEncodeFrame(
             session, imageBuffer: pixelBuffer, presentationTimeStamp: timestamp,
             duration: CMTime(value: 1, timescale: CMTimeScale(settings.frameRate)),
             frameProperties: properties, infoFlagsOut: nil
         ) { [weak self] status, _, sampleBuffer in
-            guard status == noErr, let sampleBuffer else { return }
-            self?.emit(sampleBuffer)
+            guard let self = self else { return }
+
+            var emitted = false
+            if status == noErr, let sampleBuffer = sampleBuffer {
+                emitted = self.emit(sampleBuffer)
+            }
+
+            self.onFrameFinished?(presentationValue, status, emitted)
+        }
+
+        // A synchronous submission failure does not get an output callback.
+        if submitStatus != noErr {
+            onFrameFinished?(presentationValue, submitStatus, false)
         }
     }
 
-    private func emit(_ sampleBuffer: CMSampleBuffer) {
-        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+    @discardableResult
+    private func emit(_ sampleBuffer: CMSampleBuffer) -> Bool {
+        guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return false }
 
         var totalLength = 0
         var pointer: UnsafeMutablePointer<Int8>?
         guard CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
                                           totalLengthOut: &totalLength,
                                           dataPointerOut: &pointer) == noErr,
-              let base = pointer else { return }
+              let base = pointer else { return false }
 
         let isKeyframe = Self.isKeyframe(sampleBuffer)
 
@@ -229,9 +279,11 @@ final class VideoEncoder {
             offset += 4 + length
         }
 
-        guard !out.isEmpty else { return }
-        onFramePresentationTime?(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value)
-        onEncodedFrame?(out, isKeyframe)
+        guard !out.isEmpty else { return false }
+        let presentationValue = CMSampleBufferGetPresentationTimeStamp(sampleBuffer).value
+        onFramePresentationTime?(presentationValue)
+        onEncodedFrame?(out, isKeyframe, presentationValue)
+        return true
     }
 
     private static func isKeyframe(_ sampleBuffer: CMSampleBuffer) -> Bool {
@@ -318,7 +370,11 @@ final class VideoEncoder {
 /// CGDisplayStream API because it is known to work with the virtual
 /// displays created by this application on macOS 12.
 protocol DisplayCapturer: AnyObject {
-    var onEncodedFrame: ((Data, Bool) -> Void)? { get set }
+    /// The receiver must invoke the completion after the whole access unit has
+    /// either been delivered or abandoned with its connection. This lets the
+    /// capturer bound the complete encode/network pipeline without blocking a
+    /// VideoToolbox callback.
+    var onEncodedFrame: ((Data, Bool, @escaping () -> Void) -> Void)? { get set }
     var onStreamError: ((Error) -> Void)? { get set }
 
     func start(displayID: CGDirectDisplayID,
@@ -327,6 +383,15 @@ protocol DisplayCapturer: AnyObject {
     func forceKeyframe()
     func drainEncodeLatency()
         -> (median: Double, worst: Double, count: Int)?
+    func drainPipelineMetrics() -> CapturePipelineMetrics
+}
+
+struct CapturePipelineMetrics {
+    var captureCallbacks = 0
+    var submitted = 0
+    var encoded = 0
+    var replacements = 0
+    var framesInFlight = 0
 }
 
 /// Captures one display with ScreenCaptureKit and feeds the encoder.
@@ -335,7 +400,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput, DisplayC
     private var stream: SCStream?
     private var encoder: VideoEncoder?
 
-    var onEncodedFrame: ((Data, Bool) -> Void)?
+    var onEncodedFrame: ((Data, Bool, @escaping () -> Void) -> Void)?
     var onStreamError: ((Error) -> Void)?
     /// Wall-clock time the most recent frame was captured, for latency stats.
     private(set) var lastFrameAt: Date?
@@ -349,6 +414,17 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput, DisplayC
     private var pendingCaptureAt: [Int64: CFAbsoluteTime] = [:]
     private let latencyLock = NSLock()
 
+    private let schedulingQueue = DispatchQueue(
+        label: "usbdisplay.screencapture.pipeline",
+        qos: .userInteractive
+    )
+    private let maxFramesInFlight = 2
+    private var framesInFlight = 0
+    private var outstandingFrames = Set<Int64>()
+    private var pendingLatestFrame: (CVPixelBuffer, CMTime)?
+    private let metricsLock = NSLock()
+    private var pipelineMetrics = CapturePipelineMetrics()
+
     /// Summary for the menu and the log: median and worst encode time.
     func drainEncodeLatency() -> (median: Double, worst: Double, count: Int)? {
         latencyLock.lock()
@@ -359,6 +435,15 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput, DisplayC
         guard !samples.isEmpty else { return nil }
         let sorted = samples.sorted()
         return (sorted[sorted.count / 2], sorted.last ?? 0, sorted.count)
+    }
+
+    func drainPipelineMetrics() -> CapturePipelineMetrics {
+        metricsLock.lock()
+        var result = pipelineMetrics
+        pipelineMetrics = CapturePipelineMetrics()
+        metricsLock.unlock()
+        result.framesInFlight = schedulingQueue.sync { framesInFlight }
+        return result
     }
 
     func forceKeyframe() { encoder?.forceKeyframe() }
@@ -394,8 +479,24 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput, DisplayC
         config.colorSpaceName = CGColorSpace.sRGB
 
         let encoder = try VideoEncoder(settings: settings)
-        encoder.onEncodedFrame = { [weak self] data, isKeyframe in
-            self?.onEncodedFrame?(data, isKeyframe)
+        encoder.onEncodedFrame = { [weak self] data, isKeyframe, presentationValue in
+            guard let self = self else { return }
+            self.metricsLock.lock()
+            self.pipelineMetrics.encoded += 1
+            self.metricsLock.unlock()
+
+            let completion: () -> Void = { [weak self] in
+                guard let self = self else { return }
+                self.completeFrame(presentationValue)
+            }
+            if let deliver = self.onEncodedFrame {
+                deliver(data, isKeyframe, completion)
+            } else {
+                completion()
+            }
+        }
+        encoder.onFrameFinished = { [weak self] presentationValue, _, emitted in
+            if !emitted { self?.completeFrame(presentationValue) }
         }
         encoder.onFramePresentationTime = { [weak self] presentationValue in
             guard let self else { return }
@@ -424,6 +525,11 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput, DisplayC
         stream = nil
         encoder?.invalidate()
         encoder = nil
+        schedulingQueue.sync {
+            pendingLatestFrame = nil
+            outstandingFrames.removeAll()
+            framesInFlight = 0
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -443,17 +549,53 @@ final class ScreenCapturer: NSObject, SCStreamDelegate, SCStreamOutput, DisplayC
 
         lastFrameAt = Date()
         capturedFrames += 1
+        metricsLock.lock()
+        pipelineMetrics.captureCallbacks += 1
+        metricsLock.unlock()
 
         let presentation = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        latencyLock.lock()
-        pendingCaptureAt[presentation.value] = CFAbsoluteTimeGetCurrent()
-        // Never let the map grow without bound if frames are dropped.
-        if pendingCaptureAt.count > 240 {
-            pendingCaptureAt.removeAll(keepingCapacity: true)
+        schedulingQueue.async { [weak self] in
+            self?.enqueueLatest(pixelBuffer: pixelBuffer, timestamp: presentation)
         }
-        latencyLock.unlock()
+    }
 
-        encoder?.encode(pixelBuffer: pixelBuffer, timestamp: presentation)
+    private func enqueueLatest(pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+        guard encoder != nil else { return }
+        if framesInFlight < maxFramesInFlight {
+            submit(pixelBuffer: pixelBuffer, timestamp: timestamp)
+        } else {
+            if pendingLatestFrame != nil {
+                metricsLock.lock()
+                pipelineMetrics.replacements += 1
+                metricsLock.unlock()
+            }
+            pendingLatestFrame = (pixelBuffer, timestamp)
+        }
+    }
+
+    private func submit(pixelBuffer: CVPixelBuffer, timestamp: CMTime) {
+        framesInFlight += 1
+        outstandingFrames.insert(timestamp.value)
+        metricsLock.lock()
+        pipelineMetrics.submitted += 1
+        metricsLock.unlock()
+
+        latencyLock.lock()
+        pendingCaptureAt[timestamp.value] = CFAbsoluteTimeGetCurrent()
+        latencyLock.unlock()
+        encoder?.encode(pixelBuffer: pixelBuffer, timestamp: timestamp)
+    }
+
+    private func completeFrame(_ presentationValue: Int64) {
+        schedulingQueue.async { [weak self] in
+            guard let self = self,
+                  self.outstandingFrames.remove(presentationValue) != nil else { return }
+            self.framesInFlight -= 1
+            if let pending = self.pendingLatestFrame {
+                self.pendingLatestFrame = nil
+                self.submit(pixelBuffer: pending.0, timestamp: pending.1)
+            }
+        }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

@@ -91,12 +91,22 @@ func tuneSocket(_ fd: Int32) {
     // Without this a write to a closed socket kills the whole process.
     setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
 
-    // Bound how long a stalled client can block the encoder callback.
-    var timeout = timeval(tv_sec: 5, tv_usec: 0)
+    // A network worker, never a VideoToolbox callback, performs the blocking
+    // write. Still fail a genuinely stalled display promptly rather than
+    // showing seconds of old desktop state.
+    // Fail a stalled decoder promptly. The delivery queue is separate from
+    // VideoToolbox, and the failed connection is reset below so obsolete TCP
+    // bytes cannot be played back after the decoder recovers.
+    var timeout = timeval(tv_sec: 1, tv_usec: 0)
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
-    // A large send buffer absorbs keyframe bursts without stalling.
-    var sndBuf: Int32 = 4 * 1024 * 1024
+    // Keep the video transport shallow. A multi-megabyte TCP send buffer
+    // turns a temporarily slow tablet into a time-shifted display: old frames
+    // continue to arrive seconds after the desktop has already changed.
+    // A keyframe may be larger than this; writeFully streams it while the
+    // client reads. At 5 Mbps, 64 KiB represents roughly 105 ms rather than a
+    // multi-second reservoir of obsolete pictures.
+    var sndBuf: Int32 = 64 * 1024
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndBuf, socklen_t(MemoryLayout<Int32>.size))
 }
 
@@ -137,12 +147,29 @@ func makeListeningSocket(port: UInt16, loopbackOnly: Bool) throws -> Int32 {
 
 // MARK: - Video channel
 
+struct VideoDeliveryMetrics {
+    var frames = 0
+    var bytes = 0
+    var medianSendMs: Double = 0
+    var worstSendMs: Double = 0
+    var bytesPending = 0
+}
+
 /// Serves length-prefixed video frames to one client at a time.
 final class VideoServer {
     private let lock = NSLock()
+    private let deliveryQueue = DispatchQueue(
+        label: "usbdisplay.video.delivery",
+        qos: .userInteractive
+    )
     private var listenFD: Int32 = -1
     private var clientFD: Int32 = -1
+    private var clientGeneration: UInt64 = 0
     private var running = false
+    private var pendingBytes = 0
+    private var deliveredFrames = 0
+    private var deliveredBytes = 0
+    private var sendLatenciesMs: [Double] = []
 
     let port: UInt16
     private let loopbackOnly: Bool
@@ -189,6 +216,7 @@ final class VideoServer {
             lock.lock()
             let previous = clientFD
             clientFD = fd
+            clientGeneration &+= 1
             droppedFrames = 0
             lock.unlock()
 
@@ -203,16 +231,74 @@ final class VideoServer {
         return clientFD >= 0
     }
 
-    /// Send one encoded access unit. Returns false if the client went away.
-    @discardableResult
-    func send(frame: Data) -> Bool {
+    /// Queue one complete encoded access unit for ordered delivery. The call
+    /// returns immediately, so a slow TCP peer cannot occupy VideoToolbox's
+    /// callback queue. The capturer's end-to-end admission window guarantees
+    /// this queue remains bounded without dropping P-frames.
+    func enqueue(frame: Data, completion: @escaping (Bool) -> Void) {
         lock.lock()
-        let fd = clientFD
+        let generation = clientGeneration
+        let connected = clientFD >= 0
+        if connected { pendingBytes += frame.count + 4 }
+        lock.unlock()
+
+        guard connected else {
+            completion(false)
+            return
+        }
+
+        deliveryQueue.async { [weak self] in
+            guard let self = self else {
+                completion(false)
+                return
+            }
+
+            let started = CFAbsoluteTimeGetCurrent()
+            let sent = self.send(frame: frame, generation: generation)
+            let sendMs = (CFAbsoluteTimeGetCurrent() - started) * 1000
+
+            self.lock.lock()
+            self.pendingBytes = max(0, self.pendingBytes - frame.count - 4)
+            if sent {
+                self.deliveredFrames += 1
+                self.deliveredBytes += frame.count
+                self.sendLatenciesMs.append(sendMs)
+                if self.sendLatenciesMs.count > 600 {
+                    self.sendLatenciesMs.removeFirst(300)
+                }
+            }
+            self.lock.unlock()
+            completion(sent)
+        }
+    }
+
+    func drainDeliveryMetrics() -> VideoDeliveryMetrics {
+        lock.lock()
+        let latencies = sendLatenciesMs.sorted()
+        let result = VideoDeliveryMetrics(
+            frames: deliveredFrames,
+            bytes: deliveredBytes,
+            medianSendMs: latencies.isEmpty ? 0 : latencies[latencies.count / 2],
+            worstSendMs: latencies.last ?? 0,
+            bytesPending: pendingBytes
+        )
+        deliveredFrames = 0
+        deliveredBytes = 0
+        sendLatenciesMs.removeAll(keepingCapacity: true)
+        lock.unlock()
+        return result
+    }
+
+    private func send(frame: Data, generation: UInt64) -> Bool {
+        lock.lock()
+        let fd = clientGeneration == generation ? clientFD : -1
         lock.unlock()
         guard fd >= 0 else { return false }
 
         guard VideoFraming.isPlausibleFrameLength(frame.count) else {
+            lock.lock()
             droppedFrames += 1
+            lock.unlock()
             log("Refusing to send an implausible frame of \(frame.count) bytes")
             return true
         }
@@ -222,17 +308,41 @@ final class VideoServer {
         if writeFully(fd, VideoFraming.frame(frame)) { return true }
 
         log("Video client write failed; dropping the connection")
-        dropClient()
+        dropClient(generation: generation, abortive: true)
         return false
     }
 
     func dropClient() {
+        dropClient(generation: nil, abortive: false)
+    }
+
+    private func dropClient(generation: UInt64?, abortive: Bool) {
         lock.lock()
+        if let generation = generation, generation != clientGeneration {
+            lock.unlock()
+            return
+        }
         let fd = clientFD
         clientFD = -1
+        clientGeneration &+= 1
         lock.unlock()
-        if fd >= 0 { close(fd) }
-        onClientDisconnected?()
+        if fd >= 0 {
+            if abortive {
+                // SO_LINGER(1, 0) sends RST and discards unsent bytes. A
+                // normal FIN would preserve the very backlog we are trying
+                // to escape and the tablet would continue displaying it.
+                var reset = linger(l_onoff: 1, l_linger: 0)
+                setsockopt(
+                    fd,
+                    SOL_SOCKET,
+                    SO_LINGER,
+                    &reset,
+                    socklen_t(MemoryLayout<linger>.size)
+                )
+            }
+            close(fd)
+            onClientDisconnected?()
+        }
     }
 
     func stop() {
@@ -240,6 +350,7 @@ final class VideoServer {
         lock.lock()
         let c = clientFD, l = listenFD
         clientFD = -1; listenFD = -1
+        clientGeneration &+= 1
         lock.unlock()
         if c >= 0 { close(c) }
         if l >= 0 { close(l) }

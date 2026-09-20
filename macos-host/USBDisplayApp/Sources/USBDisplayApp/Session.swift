@@ -80,11 +80,7 @@ final class StreamingSession: ObservableObject {
 
     var onStateChanged: (() -> Void)?
 
-    // Frame accounting.
-    private var frameCount = 0
-    private var byteCount = 0
     private var statsTimer: Timer?
-    private var statsTick = 0
     private var restartWorkItem: DispatchWorkItem?
     /// Kept so a scale change can rebuild the display without waiting for the
     /// client to reconnect and say hello again.
@@ -258,7 +254,8 @@ final class StreamingSession: ObservableObject {
 
         inputServer?.send(.helloAck(HelloAck(
             accepted: true,
-            displayWidth: UInt32(spec.pixelWidth), displayHeight: UInt32(spec.pixelHeight),
+            displayWidth: UInt32(spec.pixelWidth),
+            displayHeight: UInt32(spec.pixelHeight),
             message: "\(spec.pixelWidth)x\(spec.pixelHeight)")))
 
         let generation = displayGeneration
@@ -319,14 +316,19 @@ final class StreamingSession: ObservableObject {
         }
 
         let legacyVideo = lastHello?.flags.contains(.legacyVideoDecoder) == true
+        // Four Mbps visibly exhausts its quality budget during sustained
+        // full-screen motion. Six Mbps has already produced ~13 Mbps bursts
+        // and wedged the TI Ducati decoder, so move one bounded step at a time.
+        let legacyBitRate: Int32 = 5_000_000
 
         let streamFrameRate = legacyVideo ? 30 : frameRate
-        let streamBitRate: Int32 = legacyVideo ? 4_000_000 : bitRate
+        let streamBitRate: Int32 = legacyVideo ? legacyBitRate : bitRate
         let streamCodec: VideoCodec = legacyVideo ? .h264 : codec
         let streamProfile: H264Profile = legacyVideo ? .baseline : .main
 
         if legacyVideo {
-            log("Legacy video mode: H.264 Baseline, 30 fps, 4 Mbps")
+            log("Legacy video mode: H.264 Baseline, 30 fps, "
+                + "\(streamBitRate / 1_000_000) Mbps")
         }
 
         let capturer: DisplayCapturer
@@ -339,11 +341,17 @@ final class StreamingSession: ObservableObject {
             capturer = CGDisplayStreamCapturer()
         }
 
-        capturer.onEncodedFrame = { [weak self] data, _ in
-            guard let self else { return }
-            if self.videoServer?.send(frame: data) == true {
-                self.frameCount += 1
-                self.byteCount += data.count
+        let delivery = videoServer
+        capturer.onEncodedFrame = { data, _, finished in
+            guard let delivery = delivery else {
+                finished()
+                return
+            }
+            delivery.enqueue(frame: data) { _ in
+                // Release admission only after this complete access unit has
+                // left the bounded host queue. This callback is deliberately
+                // outside VideoToolbox's internal callback context.
+                finished()
             }
         }
         capturer.onStreamError = { [weak self] _ in
@@ -358,7 +366,13 @@ final class StreamingSession: ObservableObject {
                                           frameRate: streamFrameRate,
                                           bitRate: streamBitRate,
                                           codec: streamCodec,
-                                          h264Profile: streamProfile))
+                                          h264Profile: streamProfile,
+                                          maxFrameDelayCount: legacyVideo ? 0 : nil,
+                                          enforceDataRateLimit: legacyVideo,
+                                          // Frequent IDRs consume a large part
+                                          // of this low-bitrate Baseline stream
+                                          // and show up as a quality pulse.
+                                          keyframeIntervalSeconds: legacyVideo ? 4 : 2))
             guard generation == displayGeneration,
                   targetDisplayID != 0,
                   displayID == targetDisplayID else {
@@ -485,24 +499,29 @@ final class StreamingSession: ObservableObject {
         statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let owner = self else { return }
             Task { @MainActor [owner] in
-                owner.stats.fps = Double(owner.frameCount)
-                owner.stats.megabitsPerSecond = Double(owner.byteCount) * 8 / 1_000_000
+                let pipeline = owner.capturer?.drainPipelineMetrics()
+                    ?? CapturePipelineMetrics()
+                let network = owner.videoServer?.drainDeliveryMetrics()
+                    ?? VideoDeliveryMetrics()
+                owner.stats.fps = Double(network.frames)
+                owner.stats.megabitsPerSecond = Double(network.bytes) * 8 / 1_000_000
                 if let latency = owner.capturer?.drainEncodeLatency() {
                     owner.stats.encodeMedianMs = latency.median
                     owner.stats.encodeWorstMs = latency.worst
                 }
-                // Log a line every 5s so a session leaves a record of how it
-                // actually performed, rather than only showing it in a menu
-                // nobody had open at the time.
-                owner.statsTick += 1
-                if owner.statsTick % 5 == 0 && owner.clientConnected {
+                if owner.clientConnected {
                     log(String(format:
-                        "%.0f fps · %.1f Mbps · encode %.1f ms median, %.1f ms worst",
-                        owner.stats.fps, owner.stats.megabitsPerSecond,
-                        owner.stats.encodeMedianMs, owner.stats.encodeWorstMs))
+                        "pipeline capture %d/s · submit %d/s · encoded %d/s · "
+                        + "network %d/s %.1f Mbps · replace %d/s · in-flight %d · "
+                        + "pending %.1f KiB · encode %.1f/%.1f ms med/worst · "
+                        + "send %.1f/%.1f ms med/worst",
+                        pipeline.captureCallbacks, pipeline.submitted, pipeline.encoded,
+                        network.frames, owner.stats.megabitsPerSecond,
+                        pipeline.replacements, pipeline.framesInFlight,
+                        Double(network.bytesPending) / 1024,
+                        owner.stats.encodeMedianMs, owner.stats.encodeWorstMs,
+                        network.medianSendMs, network.worstSendMs))
                 }
-                owner.frameCount = 0
-                owner.byteCount = 0
                 if owner.clientConnected { owner.onStateChanged?() }
             }
         }

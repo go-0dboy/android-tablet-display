@@ -225,8 +225,9 @@ enum CaptureProbe {
         let capturer = CGDisplayStreamCapturer()
         let stats = CaptureProbeStats()
 
-        capturer.onEncodedFrame = { data, isKeyframe in
+        capturer.onEncodedFrame = { data, isKeyframe, finished in
             stats.recordFrame(data, keyframe: isKeyframe)
+            finished()
         }
 
         capturer.onStreamError = { error in
@@ -238,7 +239,10 @@ enum CaptureProbe {
             height: Int32(spec.pixelHeight),
             frameRate: 30,
             bitRate: 4_000_000,
-            codec: .h264
+            codec: .h264,
+            h264Profile: .baseline,
+            maxFrameDelayCount: 0,
+            enforceDataRateLimit: true
         )
 
         do {

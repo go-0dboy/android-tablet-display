@@ -10,6 +10,7 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import android.view.SurfaceHolder
@@ -40,11 +41,35 @@ class MainActivity : AppCompatActivity() {
         private const val READ_TIMEOUT_MS = 20_000
         private const val RECONNECT_DELAY_MS = 800L
         private const val SERVICE_TYPE = "_usbtablet._tcp."
+        private const val LEGACY_VIDEO_RECEIVE_BUFFER_BYTES = 64 * 1024
+        private const val DECODER_INPUT_STALL_MS = 500L
 
         const val ACTION_SET_TOUCH_MODE = "com.usbtablet.display.SET_TOUCH_MODE"
         const val ACTION_LOG_PEN = "com.usbtablet.display.LOG_PEN"
         const val ACTION_SHOW_FPS = "com.usbtablet.display.SHOW_FPS"
         const val ACTION_HIDE_FPS = "com.usbtablet.display.HIDE_FPS"
+
+        private fun isH264Idr(data: ByteArray): Boolean {
+            var index = 0
+            while (index + 4 < data.size) {
+                val nalIndex = when {
+                    data[index] == 0.toByte() &&
+                        data[index + 1] == 0.toByte() &&
+                        data[index + 2] == 0.toByte() &&
+                        data[index + 3] == 1.toByte() -> index + 4
+                    data[index] == 0.toByte() &&
+                        data[index + 1] == 0.toByte() &&
+                        data[index + 2] == 1.toByte() -> index + 3
+                    else -> -1
+                }
+                if (nalIndex >= 0 && nalIndex < data.size &&
+                    (data[nalIndex].toInt() and 0x1f) == 5) {
+                    return true
+                }
+                index++
+            }
+            return false
+        }
     }
 
     private lateinit var binding: ActivityMainBinding
@@ -67,6 +92,8 @@ class MainActivity : AppCompatActivity() {
     private var lastStatsAt = System.currentTimeMillis()
     private var decoderWidth = 0
     private var decoderHeight = 0
+    private var decoderNeedsKeyframe = false
+    @Volatile private var decoderResetInProgress = false
 
     private val settingsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -312,8 +339,20 @@ class MainActivity : AppCompatActivity() {
         val host = if (wirelessMode) (hostAddress ?: return) else USB_HOST
         updateStatus(waitingMessage())
 
+        val clientFlags = DeviceInfo.flags(
+            this@MainActivity,
+            translator.touchMode == TouchMode.PEN_ONLY
+        )
+        val legacyVideo = clientFlags and ClientFlags.LEGACY_VIDEO_DECODER != 0
+
         val video = Socket().apply {
             tcpNoDelay = true
+            if (legacyVideo) {
+                // MediaCodec backpressure stops this thread reading. Keep the
+                // TCP receive window shallow so adb reverse cannot become a
+                // multi-second store of old, but still valid, access units.
+                receiveBufferSize = LEGACY_VIDEO_RECEIVE_BUFFER_BYTES
+            }
             soTimeout = READ_TIMEOUT_MS
             connect(InetSocketAddress(host, videoPort), CONNECT_TIMEOUT_MS)
         }
@@ -345,8 +384,7 @@ class MainActivity : AppCompatActivity() {
             heightPixels = metrics.heightPixels,
             densityDpi = metrics.densityDpi,
             rotationDegrees = metrics.rotationDegrees,
-            flags = DeviceInfo.flags(this@MainActivity,
-                                     translator.touchMode == TouchMode.PEN_ONLY),
+            flags = clientFlags,
             deviceName = DeviceInfo.displayName()
         )
         synchronized(out) { out.write(InputCodec.encode(hello)); out.flush() }
@@ -435,7 +473,10 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun streamVideo(video: Socket, width: Int, height: Int) {
         val stream = DataInputStream(video.getInputStream().buffered(1 shl 16))
-        initDecoder(width, height)
+        // Do not allocate the legacy hardware decoder merely because a socket
+        // connected. The host always starts with an IDR, and waiting for it
+        // avoids repeated TI/ION allocations during short reconnect attempts.
+        decoderNeedsKeyframe = true
 
         updateStatus("")
         setStatsVisible(showStats)
@@ -457,6 +498,15 @@ class MainActivity : AppCompatActivity() {
 
             val frame = ByteArray(length)
             stream.readFully(frame)
+
+            if (decoderNeedsKeyframe) {
+                if (!isH264Idr(frame)) continue
+                initDecoder(width, height)
+                if (decoder == null) continue
+                decoderNeedsKeyframe = false
+                Log.i(TAG, "Decoder resumed from a fresh IDR")
+            }
+
             decodeFrame(frame)
 
             frameCount++
@@ -477,6 +527,7 @@ class MainActivity : AppCompatActivity() {
     // MARK: - Decoder
 
     private fun initDecoder(width: Int, height: Int) {
+        if (decoderResetInProgress) return
         if (decoder != null && decoderWidth == width && decoderHeight == height) return
         releaseDecoder()
         try {
@@ -508,14 +559,47 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun releaseDecoder() {
-        try { decoder?.stop(); decoder?.release() } catch (_: Exception) {}
+        val codec = decoder
         decoder = null
         decoderWidth = 0
         decoderHeight = 0
+        if (codec != null) {
+            try { codec.stop() } catch (_: Exception) {}
+            try { codec.release() } catch (_: Exception) {}
+        }
+    }
+
+    private fun resetDecoderAsync(codec: MediaCodec) {
+        if (decoder !== codec || decoderResetInProgress) {
+            decoderNeedsKeyframe = true
+            return
+        }
+
+        // A wedged TI Ducati codec can block in stop() for many seconds. Detach
+        // it first and release it on a separate IO worker so the video reader
+        // can keep draining TCP and retain only the newest host-side frames.
+        decoder = null
+        decoderWidth = 0
+        decoderHeight = 0
+        decoderNeedsKeyframe = true
+        decoderResetInProgress = true
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                try { codec.stop() } catch (_: Exception) {}
+                try { codec.release() } catch (_: Exception) {}
+            } finally {
+                decoderResetInProgress = false
+                Log.i(TAG, "Stalled decoder released; waiting for a fresh IDR")
+            }
+        }
     }
 
     private fun decodeFrame(data: ByteArray) {
-        val codec = decoder ?: return
+        val codec = decoder ?: run {
+            decoderNeedsKeyframe = true
+            return
+        }
 
         try {
             val info = MediaCodec.BufferInfo()
@@ -523,6 +607,8 @@ class MainActivity : AppCompatActivity() {
             fun drainOutput() {
                 var outputIndex = codec.dequeueOutputBuffer(info, 0)
                 while (outputIndex >= 0) {
+                    // The legacy TI surface pipeline expects every decoded
+                    // output buffer to follow its normal render lifecycle.
                     codec.releaseOutputBuffer(outputIndex, true)
                     outputIndex = codec.dequeueOutputBuffer(info, 0)
                 }
@@ -534,10 +620,17 @@ class MainActivity : AppCompatActivity() {
             drainOutput()
 
             var inputIndex = codec.dequeueInputBuffer(10_000)
+            val inputWaitStarted = SystemClock.elapsedRealtime()
 
             while (inputIndex < 0 && running.get()) {
                 // Free decoded output before waiting for another input slot.
                 drainOutput()
+                if (SystemClock.elapsedRealtime() - inputWaitStarted >=
+                    DECODER_INPUT_STALL_MS) {
+                    Log.w(TAG, "Decoder input stalled; resetting and waiting for IDR")
+                    resetDecoderAsync(codec)
+                    return
+                }
                 inputIndex = codec.dequeueInputBuffer(10_000)
             }
 
@@ -561,15 +654,15 @@ class MainActivity : AppCompatActivity() {
                 inputIndex,
                 0,
                 data.size,
-                0,
+                System.nanoTime() / 1_000,
                 0
             )
 
             drainOutput()
 
         } catch (e: IllegalStateException) {
-            Log.e(TAG, "Decoder fell over; restarting it", e)
-            releaseDecoder()
+            Log.e(TAG, "Decoder fell over; waiting for a fresh IDR", e)
+            resetDecoderAsync(codec)
         }
     }
 
@@ -581,6 +674,7 @@ class MainActivity : AppCompatActivity() {
         inputSocket = null
         videoSocket = null
         releaseDecoder()
+        decoderNeedsKeyframe = false
     }
 
     // MARK: - UI
