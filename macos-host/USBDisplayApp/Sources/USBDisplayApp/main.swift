@@ -657,16 +657,22 @@ enum VirtualDisplayManagerBridge {
 // MARK: - Entry point
 
 // Swift 5.7 does not provide MainActor.assumeIsolated.
-// Enter the main actor explicitly, then hand control to NSApplication.
-Task { @MainActor in
+//
+// main.swift starts synchronously on the process main thread, which is
+// exactly where AppKit requires NSApplication.run() to live.  On Swift 5.7
+// @MainActor(unsafe) lets us express that fact without moving AppKit's
+// event loop into a Swift Concurrency Task.
+@MainActor(unsafe)
+private func runApplication() {
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate
+
     // NSApplication keeps only a weak reference to its delegate.
     objc_setAssociatedObject(app, "usbdisplay.delegate", delegate,
                              .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+
     app.run()
-    exit(0)
 }
 
-dispatchMain()
+runApplication()
