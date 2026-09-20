@@ -349,14 +349,18 @@ final class StreamingSession: ObservableObject {
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(forName: NSWorkspace.didWakeNotification,
                            object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in
+            guard let owner = self else { return }
+            Task { @MainActor [owner] in
                 log("The Mac woke; rebuilding the session")
-                self?.scheduleRestart()
+                owner.scheduleRestart()
             }
         }
         center.addObserver(forName: NSWorkspace.screensDidWakeNotification,
                            object: nil, queue: .main) { [weak self] _ in
-            Task { @MainActor in self?.capturer?.forceKeyframe() }
+            guard let owner = self else { return }
+            Task { @MainActor [owner] in
+                owner.capturer?.forceKeyframe()
+            }
         }
     }
 
@@ -366,7 +370,10 @@ final class StreamingSession: ObservableObject {
     private func scheduleRestart() {
         restartWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor in await self?.restart() }
+            guard let owner = self else { return }
+            Task { @MainActor [owner] in
+                await owner.restart()
+            }
         }
         restartWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
@@ -389,27 +396,27 @@ final class StreamingSession: ObservableObject {
 
     private func startStatsTimer() {
         statsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                guard let self else { return }
-                self.stats.fps = Double(self.frameCount)
-                self.stats.megabitsPerSecond = Double(self.byteCount) * 8 / 1_000_000
-                if let latency = self.capturer?.drainEncodeLatency() {
-                    self.stats.encodeMedianMs = latency.median
-                    self.stats.encodeWorstMs = latency.worst
+            guard let owner = self else { return }
+            Task { @MainActor [owner] in
+                owner.stats.fps = Double(owner.frameCount)
+                owner.stats.megabitsPerSecond = Double(owner.byteCount) * 8 / 1_000_000
+                if let latency = owner.capturer?.drainEncodeLatency() {
+                    owner.stats.encodeMedianMs = latency.median
+                    owner.stats.encodeWorstMs = latency.worst
                 }
                 // Log a line every 5s so a session leaves a record of how it
                 // actually performed, rather than only showing it in a menu
                 // nobody had open at the time.
-                self.statsTick += 1
-                if self.statsTick % 5 == 0 && self.clientConnected {
+                owner.statsTick += 1
+                if owner.statsTick % 5 == 0 && owner.clientConnected {
                     log(String(format:
                         "%.0f fps · %.1f Mbps · encode %.1f ms median, %.1f ms worst",
-                        self.stats.fps, self.stats.megabitsPerSecond,
-                        self.stats.encodeMedianMs, self.stats.encodeWorstMs))
+                        owner.stats.fps, owner.stats.megabitsPerSecond,
+                        owner.stats.encodeMedianMs, owner.stats.encodeWorstMs))
                 }
-                self.frameCount = 0
-                self.byteCount = 0
-                if self.clientConnected { self.onStateChanged?() }
+                owner.frameCount = 0
+                owner.byteCount = 0
+                if owner.clientConnected { owner.onStateChanged?() }
             }
         }
     }

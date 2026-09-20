@@ -4,6 +4,7 @@
 // Wi-Fi, pick a device, set the touch mode, and manage the Wacom preset.
 
 import Foundation
+import Dispatch
 import AppKit
 import CoreGraphics
 import ApplicationServices
@@ -109,10 +110,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.pollDevices() }
+            guard let owner = self else { return }
+            Task { @MainActor [owner] in
+                owner.pollDevices()
+            }
         }
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.pollDisplays() }
+            guard let owner = self else { return }
+            Task { @MainActor [owner] in
+                owner.pollDisplays()
+            }
         }
     }
 
@@ -649,10 +656,9 @@ enum VirtualDisplayManagerBridge {
 
 // MARK: - Entry point
 
-// AppDelegate is main-actor isolated, and main.swift's top level is not, so
-// assert the isolation we already have: this code only ever runs on the main
-// thread.
-MainActor.assumeIsolated {
+// Swift 5.7 does not provide MainActor.assumeIsolated.
+// Enter the main actor explicitly, then hand control to NSApplication.
+Task { @MainActor in
     let app = NSApplication.shared
     let delegate = AppDelegate()
     app.delegate = delegate
@@ -660,4 +666,7 @@ MainActor.assumeIsolated {
     objc_setAssociatedObject(app, "usbdisplay.delegate", delegate,
                              .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
     app.run()
+    exit(0)
 }
+
+dispatchMain()
