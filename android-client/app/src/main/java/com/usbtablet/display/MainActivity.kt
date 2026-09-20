@@ -140,9 +140,12 @@ class MainActivity : AppCompatActivity() {
             systemBarsBehavior =
                 WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             window.attributes.layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            window.attributes.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
     }
 
@@ -480,10 +483,17 @@ class MainActivity : AppCompatActivity() {
             val format = MediaFormat.createVideoFormat(
                 MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height)
-                setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
-                // Samsung's decoder honours this vendor key on One UI even
-                // when the standard one is ignored; setting both is harmless.
-                setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+
+                // Android 11 introduced the standard low-latency decoder hint.
+                // Older MediaCodec implementations may reject unknown format
+                // keys, so do not send these hints to legacy devices.
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+
+                    // Some Qualcomm/Samsung decoders honour this vendor hint
+                    // even when the standard key is ignored.
+                    setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
+                }
             }
             decoder = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
                 configure(format, binding.surfaceView.holder.surface, null, 0)
