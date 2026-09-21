@@ -38,7 +38,7 @@ Baseline, 1280x800 at 30 fps and a 5 Mbps target on the tested Galaxy Tab 2.
 ## Install
 
 Ready-built applications are attached to the
-[latest GitHub release](https://github.com/not-inept/android-tablet-display/releases/latest):
+[latest GitHub release](https://github.com/go-0dboy/android-tablet-display/releases/latest):
 
 - `Android-Tablet-Display-macOS-v2.0.0.zip` — the macOS menu-bar app;
 - `Android-Tablet-Display-Android-v2.0.0.apk` — the Android client.
